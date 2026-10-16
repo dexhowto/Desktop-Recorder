@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::encoder::{
@@ -39,10 +39,91 @@ struct HandlerFlags {
     first_frame_unix: Arc<Mutex<Option<f64>>>,
 }
 
+/// How often the latest frame is copied for `LastFrame`.
+const LAST_FRAME_COPY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A CPU copy of a recent frame: BGRA rows from the bottom up, the encoder's size.
+///
+/// Windows Graphics Capture only delivers a frame when the screen changes, and
+/// a visible cursor counts as a change. Without the cursor a still screen sends
+/// nothing, so the video would end at the last change, long before Stop, and
+/// the telemetry, clicks and arrows after it would fall outside the video. At
+/// Stop this frame is sent once more, so the video lasts the whole recording.
+struct LastFrame {
+    bgra_bottom_up: Vec<u8>,
+    copied_at: Instant,
+}
+
 /// Receives frames on the capture thread and feeds them to the encoder.
 struct FrameHandler {
     encoder: Option<VideoEncoder>,
     first_frame_unix: Arc<Mutex<Option<f64>>>,
+    width: u32,
+    height: u32,
+    last_frame: Option<LastFrame>,
+    /// Timestamp (100 ns units) of the newest frame sent to the encoder
+    last_timestamp: i64,
+}
+
+impl FrameHandler {
+    /// Copies `frame` into `last_frame`, cropped or padded to the encoder size.
+    fn copy_last_frame(&mut self, frame: &mut Frame) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (fw, fh) = (frame.width() as usize, frame.height() as usize);
+        let Ok(mut buffer) = frame.buffer() else {
+            return;
+        };
+        let pitch = buffer.row_pitch() as usize;
+        let src = buffer.as_raw_buffer();
+        let mut out = vec![0u8; w * h * 4];
+        let row_bytes = w.min(fw) * 4;
+        for y in 0..h.min(fh) {
+            let from = y * pitch;
+            // The encoder's raw path wants the bottom row first
+            let to = (h - 1 - y) * w * 4;
+            if let (Some(src_row), Some(dst_row)) =
+                (src.get(from..from + row_bytes), out.get_mut(to..to + row_bytes))
+            {
+                dst_row.copy_from_slice(src_row);
+            }
+        }
+        self.last_frame = Some(LastFrame {
+            bgra_bottom_up: out,
+            copied_at: Instant::now(),
+        });
+    }
+
+    /// Ends the video at `now` (same clock as frame timestamps) with the last
+    /// copied frame, then finishes the file.
+    fn finish(&mut self, now: i64) {
+        let Some(mut encoder) = self.encoder.take() else {
+            return;
+        };
+        if let Some(last) = self.last_frame.take() {
+            if now > self.last_timestamp {
+                if let Err(e) = encoder.send_frame_buffer(&last.bgra_bottom_up, now) {
+                    super::log_line(&format!("Could not add the closing frame: {e}"));
+                }
+            }
+        }
+        if let Err(e) = encoder.finish() {
+            super::log_line(&format!("Failed to finish the video file: {e}"));
+        }
+    }
+}
+
+/// Now on the clock of `Frame::timestamp` (QueryPerformanceCounter, 100 ns units).
+fn capture_clock_now() -> i64 {
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    let (mut count, mut freq) = (0i64, 0i64);
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut count);
+        let _ = QueryPerformanceFrequency(&mut freq);
+    }
+    if freq <= 0 {
+        return 0;
+    }
+    (count as i128 * 10_000_000 / freq as i128) as i64
 }
 
 impl GraphicsCaptureApiHandler for FrameHandler {
@@ -70,6 +151,10 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         Ok(Self {
             encoder: Some(encoder),
             first_frame_unix: f.first_frame_unix,
+            width: f.width,
+            height: f.height,
+            last_frame: None,
+            last_timestamp: 0,
         })
     }
 
@@ -87,6 +172,16 @@ impl GraphicsCaptureApiHandler for FrameHandler {
             encoder
                 .send_frame(frame)
                 .map_err(|e| format!("Failed to encode a frame: {e}"))?;
+            if let Ok(ts) = frame.timestamp() {
+                self.last_timestamp = ts.Duration;
+            }
+            let due = self
+                .last_frame
+                .as_ref()
+                .is_none_or(|f| f.copied_at.elapsed() >= LAST_FRAME_COPY_INTERVAL);
+            if due {
+                self.copy_last_frame(frame);
+            }
         }
         Ok(())
     }
@@ -230,15 +325,11 @@ impl ScreenCapture {
             return;
         };
         let handler = control.callback();
+        let stopped_at = capture_clock_now();
         if let Err(e) = control.stop() {
-            eprintln!("Warning: screen capture did not stop cleanly: {e:?}");
+            super::log_line(&format!("Screen capture did not stop cleanly: {e:?}"));
         }
-        let encoder = handler.lock().encoder.take();
-        if let Some(encoder) = encoder {
-            if let Err(e) = encoder.finish() {
-                eprintln!("Warning: failed to finish the video file: {e}");
-            }
-        }
+        handler.lock().finish(stopped_at);
     }
 }
 
