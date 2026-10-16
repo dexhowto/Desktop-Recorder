@@ -53,6 +53,36 @@ pub struct TelemetrySession {
     pub jsonl_path: PathBuf,
 }
 
+/// How long before and after a moved click the cursor path bends toward its new spot.
+const MOVED_CLICK_BLEND_SECS: f64 = 0.4;
+
+/// Moves `s` by (`dx`, `dy`) in normalized screen units, keeping its pixel
+/// coordinates and raw record in step.
+fn shift_sample(s: &mut TelemetrySample, dx: f64, dy: f64, display: Option<(f64, f64)>) {
+    // Pixels per normalized unit: the display size, or read off the sample itself
+    let scale = |px: f64, norm: f64, dim: Option<f64>| {
+        dim.unwrap_or(if norm.abs() > 1e-6 { px / norm } else { 0.0 })
+    };
+    let px_dx = dx * scale(s.x, s.norm_x, display.map(|d| d.0));
+    let px_dy = dy * scale(s.y, s.norm_y, display.map(|d| d.1));
+    s.norm_x = (s.norm_x + dx).clamp(0.0, 1.0);
+    s.norm_y = (s.norm_y + dy).clamp(0.0, 1.0);
+    s.x += px_dx;
+    s.y += px_dy;
+    if let Some(obj) = s.raw_json.as_object_mut() {
+        let round = |v: f64, scale: f64| (v * scale).round() / scale;
+        obj.insert("norm_x".into(), serde_json::json!(round(s.norm_x, 10_000.0)));
+        obj.insert("norm_y".into(), serde_json::json!(round(s.norm_y, 10_000.0)));
+        obj.insert("x".into(), serde_json::json!(round(s.x, 100.0)));
+        obj.insert("y".into(), serde_json::json!(round(s.y, 100.0)));
+        for (key, d) in [("global_x", px_dx), ("global_y", px_dy)] {
+            if let Some(g) = obj.get(key).and_then(|v| v.as_f64()) {
+                obj.insert(key.into(), serde_json::json!(round(g + d, 100.0)));
+            }
+        }
+    }
+}
+
 /// Ctrl/⌘-held samples closer together than this belong to the same protected stretch.
 const CTRL_RUN_MAX_GAP_SECS: f64 = 0.25;
 
@@ -306,14 +336,7 @@ impl TelemetrySession {
 
         let fps = fps.max(1) as f64;
         // Recorded pixel size of the display, so x/y and norm_x/norm_y stay consistent
-        let dim = |key: &str| {
-            self.session_start
-                .get("display")
-                .and_then(|d| d.get(key))
-                .and_then(|v| v.as_f64())
-                .filter(|v| *v > 0.0)
-        };
-        let display = dim("width").zip(dim("height"));
+        let display = self.display_size();
         let mut out: Vec<TelemetrySample> = Vec::new();
 
         // Glide from where the cursor was at the start of the recording to the first click
@@ -368,18 +391,11 @@ impl TelemetrySession {
         let mut drop = vec![false; self.samples.len()];
         let mut release: Vec<(usize, String)> = Vec::new();
         for &idx in removed {
-            let Some(click) = self.samples.get(idx) else {
+            let Some((btn, down_idx)) = self.click_span(idx) else {
                 continue;
             };
-            let btn = click.button.clone().unwrap_or_else(|| {
-                click.event.split('_').next().unwrap_or("left").replace("double", "left")
-            });
             let down_evt = format!("{btn}_down");
             let up_evt = format!("{btn}_up");
-            let down_idx = self.samples[..idx]
-                .iter()
-                .rposition(|s| s.event == down_evt)
-                .unwrap_or(idx);
             drop[idx] = true;
             for i in down_idx..idx {
                 let ev = &self.samples[i].event;
@@ -419,6 +435,62 @@ impl TelemetrySession {
             session_end: self.session_end.clone(),
             jsonl_path: self.jsonl_path.clone(),
         }
+    }
+
+    /// The button of the click record at `idx` and the index of the button-down
+    /// record that started it (`idx` itself when none is found).
+    fn click_span(&self, idx: usize) -> Option<(String, usize)> {
+        let click = self.samples.get(idx)?;
+        let btn = click.button.clone().unwrap_or_else(|| {
+            click.event.split('_').next().unwrap_or("left").replace("double", "left")
+        });
+        let down_evt = format!("{btn}_down");
+        let down_idx = self.samples[..idx]
+            .iter()
+            .rposition(|s| s.event == down_evt)
+            .unwrap_or(idx);
+        Some((btn, down_idx))
+    }
+
+    /// Recorded pixel size of the display, from the session header.
+    fn display_size(&self) -> Option<(f64, f64)> {
+        let dim = |key: &str| {
+            self.session_start
+                .get("display")
+                .and_then(|d| d.get(key))
+                .and_then(|v| v.as_f64())
+                .filter(|v| *v > 0.0)
+        };
+        dim("width").zip(dim("height"))
+    }
+
+    /// Copy with the clicks at `moved` (index into `samples`, new normalized
+    /// point) placed somewhere else. The press, the hold and the click move by the
+    /// full amount; the path just before and after bends toward the new spot so
+    /// the cursor still glides into and out of the click.
+    pub fn with_moved_clicks(&self, moved: &[(usize, (f64, f64))]) -> TelemetrySession {
+        let mut out = self.clone();
+        let display = self.display_size();
+        for &(idx, to) in moved {
+            let (Some(click), Some((_, down_idx))) = (self.samples.get(idx), self.click_span(idx)) else {
+                continue;
+            };
+            let (dx, dy) = (to.0 - click.norm_x, to.1 - click.norm_y);
+            let (t_down, t_click) = (self.samples[down_idx].t, click.t);
+            for s in out.samples.iter_mut() {
+                let w = if s.t < t_down {
+                    1.0 - (t_down - s.t) / MOVED_CLICK_BLEND_SECS
+                } else if s.t <= t_click {
+                    1.0
+                } else {
+                    1.0 - (s.t - t_click) / MOVED_CLICK_BLEND_SECS
+                };
+                if w > 0.0 {
+                    shift_sample(s, dx * w, dy * w, display);
+                }
+            }
+        }
+        out
     }
 
     pub fn retimed(&self, kept_segments: &[(f64, f64)], fps: u32) -> TelemetrySession {
@@ -1048,6 +1120,10 @@ pub struct VideoEditor {
     // when the arrows are found again), and the arrow selected on the timeline
     pub removed_arrows: Vec<f64>,
     pub selected_arrow: Option<f64>,
+    // Clicks dragged to a new spot in the preview: (click index, normalized point)
+    pub moved_clicks: Vec<(usize, (f64, f64))>,
+    // Arrows whose ends were dragged in the preview: (⌘ press time, new tail, new tip)
+    pub moved_arrows: Vec<(f64, (f64, f64), (f64, f64))>,
 
     // Interactive dragging & Mark In/Out selection
     pub active_drag: Option<DragTarget>,
@@ -1080,12 +1156,14 @@ pub struct VideoEditor {
     pub keys: KeyBindings,
 }
 
-/// One undo step: the cut list and the removed clicks and arrows.
+/// One undo step: the cut list and the removed or moved clicks and arrows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditState {
     cuts: Vec<CutScene>,
     removed_clicks: Vec<usize>,
     removed_arrows: Vec<f64>,
+    moved_clicks: Vec<(usize, (f64, f64))>,
+    moved_arrows: Vec<(f64, (f64, f64), (f64, f64))>,
 }
 
 #[derive(Clone, Debug)]
@@ -1209,6 +1287,8 @@ impl VideoEditor {
         self.selected_click = None;
         self.removed_arrows.clear();
         self.selected_arrow = None;
+        self.moved_clicks.clear();
+        self.moved_arrows.clear();
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.clean_moves_on = false;
@@ -1262,6 +1342,8 @@ impl VideoEditor {
             selected_click: None,
             removed_arrows: Vec::new(),
             selected_arrow: None,
+            moved_clicks: Vec::new(),
+            moved_arrows: Vec::new(),
             active_drag: None,
             mark_in: None,
             mark_out: None,
@@ -1295,7 +1377,10 @@ impl VideoEditor {
             return Ok(None);
         };
         let kept = compute_kept_segments(&self.cuts, self.total_duration);
-        let track = tel.without_clicks(&self.removed_clicks).retimed(&kept, self.fps);
+        let track = tel
+            .with_moved_clicks(&self.moved_clicks)
+            .without_clicks(&self.removed_clicks)
+            .retimed(&kept, self.fps);
         if clean {
             track.clean_moves(self.fps, &self.keys).map(Some)
         } else {
@@ -1378,6 +1463,8 @@ impl VideoEditor {
             cuts: self.cuts.clone(),
             removed_clicks: self.removed_clicks.clone(),
             removed_arrows: self.removed_arrows.clone(),
+            moved_clicks: self.moved_clicks.clone(),
+            moved_arrows: self.moved_arrows.clone(),
         }
     }
 
@@ -1386,6 +1473,8 @@ impl VideoEditor {
         self.cuts = state.cuts;
         self.removed_clicks = state.removed_clicks;
         self.removed_arrows = state.removed_arrows;
+        self.moved_clicks = state.moved_clicks;
+        self.moved_arrows = state.moved_arrows;
         prev
     }
 
@@ -1451,12 +1540,88 @@ impl VideoEditor {
     }
 
     /// Arrows still in the video: not removed in the editor.
+    /// Arrows still in the video: not removed in the editor, with dragged ends applied.
     pub fn kept_arrows(&self) -> Vec<Arrow> {
         self.arrows
             .iter()
             .filter(|a| !self.removed_arrows.contains(&a.pressed_t))
-            .cloned()
+            .map(|a| self.arrow_with_moves(a))
             .collect()
+    }
+
+    /// `arrow` with its tail and tip where they were dragged. The growing tip
+    /// path shifts from the tail's move at its start to the tip's move at its end.
+    fn arrow_with_moves(&self, arrow: &Arrow) -> Arrow {
+        let Some(&(_, from, to)) = self.moved_arrows.iter().find(|m| m.0 == arrow.pressed_t) else {
+            return arrow.clone();
+        };
+        let d_from = (from.0 - arrow.from.0, from.1 - arrow.from.1);
+        let d_to = (to.0 - arrow.to.0, to.1 - arrow.to.1);
+        let last = arrow.path.len().saturating_sub(1).max(1) as f64;
+        let path = arrow
+            .path
+            .iter()
+            .enumerate()
+            .map(|(i, &(t, p))| {
+                let k = i as f64 / last;
+                let d = (d_from.0 + (d_to.0 - d_from.0) * k, d_from.1 + (d_to.1 - d_from.1) * k);
+                (t, (p.0 + d.0, p.1 + d.1))
+            })
+            .collect();
+        Arrow { from, to, path, ..arrow.clone() }
+    }
+
+    /// Where the click at `idx` happens on screen (normalized), after any move.
+    pub fn click_point(&self, idx: usize) -> Option<(f64, f64)> {
+        if let Some(&(_, p)) = self.moved_clicks.iter().find(|m| m.0 == idx) {
+            return Some(p);
+        }
+        let s = self.telemetry.as_ref()?.samples.get(idx)?;
+        Some((s.norm_x, s.norm_y))
+    }
+
+    /// Places the click at `idx` at normalized point `p`. Call `push_history` once
+    /// before a drag starts, not on every step.
+    pub fn move_click(&mut self, idx: usize, p: (f64, f64)) {
+        let p = (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0));
+        match self.moved_clicks.iter_mut().find(|m| m.0 == idx) {
+            Some(m) => m.1 = p,
+            None => self.moved_clicks.push((idx, p)),
+        }
+    }
+
+    /// The arrow whose ⌘ press was at `pressed_t`, with dragged ends applied.
+    pub fn arrow_at(&self, pressed_t: f64) -> Option<Arrow> {
+        self.arrows
+            .iter()
+            .find(|a| a.pressed_t == pressed_t)
+            .map(|a| self.arrow_with_moves(a))
+    }
+
+    /// Sets the tail and tip of the arrow pressed at `pressed_t`. Call
+    /// `push_history` once before a drag starts, not on every step.
+    pub fn move_arrow(&mut self, pressed_t: f64, from: (f64, f64), to: (f64, f64)) {
+        let clamp = |p: (f64, f64)| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0));
+        let (from, to) = (clamp(from), clamp(to));
+        match self.moved_arrows.iter_mut().find(|m| m.0 == pressed_t) {
+            Some(m) => (m.1, m.2) = (from, to),
+            None => self.moved_arrows.push((pressed_t, from, to)),
+        }
+    }
+
+    /// Puts the selected click or arrow back where it was recorded.
+    pub fn reset_selected_position(&mut self) {
+        if let Some(idx) = self.selected_click {
+            if self.moved_clicks.iter().any(|m| m.0 == idx) {
+                self.push_history();
+                self.moved_clicks.retain(|m| m.0 != idx);
+            }
+        } else if let Some(t) = self.selected_arrow {
+            if self.moved_arrows.iter().any(|m| m.0 == t) {
+                self.push_history();
+                self.moved_arrows.retain(|m| m.0 != t);
+            }
+        }
     }
 
     fn fix_selection_after_history(&mut self) {
@@ -2637,6 +2802,7 @@ fn render_preview(ui: &mut egui::Ui, editor: &mut VideoEditor, height: f32) {
     // The cursor follows the path of the cut video, exactly as it will be exported
     let out_t = editor.output_time_of(editor.current_time);
     let Some(sample) = editor.cursor_track().and_then(|t| t.sample_at(out_t)) else {
+        render_position_handles(ui, &painter, editor, video_rect);
         return;
     };
 
@@ -2697,6 +2863,86 @@ fn render_preview(ui: &mut egui::Ui, editor: &mut VideoEditor, height: f32) {
     painter.rect_filled(hud_rect, 10.0, Color32::from_black_alpha(170));
     let text_color = if is_click { theme::WARN } else { theme::TEXT };
     painter.galley(hud_rect.center() - galley.size() / 2.0, galley, text_color);
+
+    render_position_handles(ui, &painter, editor, video_rect);
+}
+
+/// Drag handles on the preview for the click or arrow selected on the timeline:
+/// the click's cursor can be moved, and the arrow's tail and tip each moved.
+fn render_position_handles(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    editor: &mut VideoEditor,
+    video_rect: Rect,
+) {
+    let to_screen = |p: (f64, f64)| {
+        Pos2::new(
+            video_rect.left() + p.0 as f32 * video_rect.width(),
+            video_rect.top() + p.1 as f32 * video_rect.height(),
+        )
+    };
+    let to_norm = |d: Vec2| {
+        (
+            d.x as f64 / video_rect.width().max(1.0) as f64,
+            d.y as f64 / video_rect.height().max(1.0) as f64,
+        )
+    };
+    // One draggable handle: returns how far it moved this frame (normalized)
+    let handle = |ui: &mut egui::Ui, editor: &mut VideoEditor, id: &str, at: Pos2, hint: &str| {
+        let resp = ui
+            .interact(Rect::from_center_size(at, Vec2::splat(26.0)), ui.id().with(id), Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text(hint);
+        let active = resp.hovered() || resp.dragged();
+        painter.circle(
+            at,
+            if active { 9.0 } else { 7.5 },
+            theme::SELECTED.gamma_multiply(0.35),
+            Stroke::new(2.0, theme::SELECTED),
+        );
+        if resp.drag_started() {
+            editor.push_history();
+        }
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let d = resp.drag_delta();
+            if d != Vec2::ZERO {
+                return Some(to_norm(d));
+            }
+        }
+        None
+    };
+
+    if let Some(idx) = editor.selected_click {
+        let Some(p) = editor.click_point(idx) else {
+            return;
+        };
+        let at = to_screen(p);
+        let style = &editor.cursor_style;
+        draw_cursor(painter, at, style.icon, style.unit_px(video_rect.height()));
+        if let Some((dx, dy)) = handle(ui, editor, "click_handle", at, "Drag to move this click") {
+            editor.move_click(idx, (p.0 + dx, p.1 + dy));
+        }
+    } else if let Some(t) = editor.selected_arrow {
+        let Some(arrow) = editor.arrow_at(t) else {
+            return;
+        };
+        let style = &editor.arrow_style;
+        let thickness = style.thickness_px(video_rect.height());
+        let (from, to) = (to_screen(arrow.from), to_screen(arrow.to));
+        draw_arrow(painter, from, to, thickness, style.rgba, 1.0);
+        let tail = handle(ui, editor, "arrow_tail_handle", from, "Drag to move where the arrow starts");
+        let tip = handle(ui, editor, "arrow_tip_handle", to, "Drag to move where the arrow points");
+        if tail.is_some() || tip.is_some() {
+            let (tdx, tdy) = tail.unwrap_or_default();
+            let (pdx, pdy) = tip.unwrap_or_default();
+            editor.move_arrow(
+                t,
+                (arrow.from.0 + tdx, arrow.from.1 + tdy),
+                (arrow.to.0 + pdx, arrow.to.1 + pdy),
+            );
+        }
+    }
 }
 
 // ── Transport Bar ────────────────────────────────────────────────────────────
@@ -2930,6 +3176,32 @@ fn render_inspector(ui: &mut egui::Ui, editor: &mut VideoEditor) {
         .and_then(|id| editor.cuts.iter().position(|c| c.id == id))
     {
         render_cut_inspector(ui, editor, cut_idx);
+        ui.add_space(16.0);
+    }
+
+    // Selected click or arrow: moved by dragging its handles in the preview
+    let selected = match (editor.selected_click, editor.selected_arrow) {
+        (Some(idx), _) => Some(("CLICK", editor.moved_clicks.iter().any(|m| m.0 == idx))),
+        (None, Some(t)) => Some(("ARROW", editor.moved_arrows.iter().any(|m| m.0 == t))),
+        _ => None,
+    };
+    if let Some((kind, moved)) = selected {
+        section_label(ui, &format!("SELECTED {kind}"));
+        card(ui, |ui| {
+            let hint = if kind == "CLICK" {
+                "Drag the cursor handle in the preview to move this click. Delete removes it."
+            } else {
+                "Drag the start or end handle in the preview to move this arrow. Delete removes it."
+            };
+            ui.label(RichText::new(hint).size(12.0).color(theme::TEXT_DIM));
+            ui.add_space(8.0);
+            if button(ui, ButtonKind::Subtle, "Reset position", moved)
+                .on_hover_text("Put it back where it was recorded (undo with ⌘Z)")
+                .clicked()
+            {
+                editor.reset_selected_position();
+            }
+        });
         ui.add_space(16.0);
     }
 
@@ -3648,10 +3920,18 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
                 editor.selected_click = Some(idx);
                 editor.selected_arrow = None;
                 editor.selected_cut_id = None;
+                // Show the frame of the click so it can be moved in the preview
+                if let Some(t) = editor.telemetry.as_ref().and_then(|tel| tel.samples.get(idx)).map(|s| s.t) {
+                    editor.seek(t);
+                }
             } else if let Some(t) = hit_arrow(pos) {
                 editor.selected_arrow = Some(t);
                 editor.selected_click = None;
                 editor.selected_cut_id = None;
+                // Show the frame where the arrow is finished, to move its ends
+                if let Some(released) = editor.arrow_at(t).map(|a| a.released_t) {
+                    editor.seek(released);
+                }
             } else {
                 editor.selected_click = None;
                 editor.selected_arrow = None;
@@ -4119,6 +4399,69 @@ mod tests {
         );
         assert!(!out.samples[1].left_down);
         assert_eq!(out.samples[1].raw_json["buttons"]["left"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_with_moved_clicks_moves_press_and_bends_path() {
+        let mk = |t: f64, event: &str, button: Option<&str>| TelemetrySample {
+            t,
+            time_ms: (t * 1000.0) as u64,
+            frame: 0,
+            norm_x: 0.5,
+            norm_y: 0.5,
+            x: 500.0,
+            y: 250.0,
+            is_inside: true,
+            event: event.to_string(),
+            button: button.map(|b| b.to_string()),
+            left_down: event == "left_down",
+            right_down: false,
+            click_duration_ms: None,
+            click_count: None,
+            raw_json: serde_json::json!({"event": event, "norm_x": 0.5, "x": 500.0}),
+        };
+        let session = TelemetrySession {
+            session_start: serde_json::json!({"display": {"width": 1000, "height": 500}}),
+            samples: vec![
+                mk(0.0, "move", None),
+                mk(0.8, "move", None),
+                mk(1.0, "left_down", Some("left")),
+                mk(1.1, "left_up", Some("left")),
+                mk(1.1, "left_click", Some("left")),
+                mk(1.3, "move", None),
+                mk(3.0, "move", None),
+            ],
+            session_end: None,
+            jsonl_path: PathBuf::new(),
+        };
+        let out = session.with_moved_clicks(&[(4, (0.7, 0.5))]);
+        let xs: Vec<f64> = out.samples.iter().map(|s| (s.norm_x * 1000.0).round() / 1000.0).collect();
+        // Far away: untouched. Press to click: full move. Just before/after: partly moved.
+        assert_eq!(xs, [0.5, 0.6, 0.7, 0.7, 0.7, 0.6, 0.5]);
+        assert!((out.samples[4].x - 700.0).abs() < 1e-6);
+        assert_eq!(out.samples[4].raw_json["norm_x"], serde_json::json!(0.7));
+    }
+
+    #[test]
+    fn test_move_arrow_ends_and_undo() {
+        let dummy = std::env::temp_dir().join("dummy_move_arrow.mp4");
+        let _ = File::create(&dummy);
+        let mut editor = VideoEditor::open(dummy.clone(), None);
+        editor.arrows = vec![Arrow {
+            pressed_t: 1.0,
+            released_t: 1.5,
+            from: (0.2, 0.2),
+            to: (0.6, 0.6),
+            path: vec![(1.0, (0.2, 0.2)), (1.5, (0.6, 0.6))],
+        }];
+        editor.push_history();
+        editor.move_arrow(1.0, (0.1, 0.2), (0.8, 0.6));
+        let a = &editor.kept_arrows()[0];
+        assert_eq!((a.from, a.to), ((0.1, 0.2), (0.8, 0.6)));
+        assert_eq!(a.path.last().unwrap().1, (0.8, 0.6));
+        editor.undo();
+        assert_eq!(editor.kept_arrows()[0].to, (0.6, 0.6));
+        let _ = std::fs::remove_file(dummy);
     }
 
     #[test]
