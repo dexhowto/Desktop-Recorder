@@ -42,6 +42,14 @@ pub fn init() {
     self::windows::display::init_dpi_awareness();
 }
 
+/// Notes a startup step in the Windows log, to find where a start fails.
+pub fn trace(step: &str) {
+    #[cfg(windows)]
+    self::windows::log_line(step);
+    #[cfg(not(windows))]
+    let _ = step;
+}
+
 /// A command that never opens a console window (ffmpeg, ffprobe…).
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     #[allow(unused_mut)]

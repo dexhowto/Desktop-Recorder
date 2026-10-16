@@ -79,6 +79,7 @@ pub struct DexHowToApp {
 
 impl DexHowToApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::platform::trace("Window created, setting up the app");
         // Transparent window styling for floating dock
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::TRANSPARENT;
@@ -92,7 +93,9 @@ impl DexHowToApp {
         visuals.widgets.active.bg_fill = Color32::from_rgb(60, 64, 76);
         cc.egui_ctx.set_visuals(visuals);
 
+        crate::platform::trace("Creating the tray icon");
         let tray = TrayManager::new();
+        crate::platform::trace(if tray.is_some() { "Tray icon ready" } else { "No tray icon" });
 
         let prefs = crate::prefs::Preferences::load();
 
@@ -611,6 +614,7 @@ impl eframe::App for DexHowToApp {
         // Enforce ideal window geometry and bottom position on startup
         if !self.did_initial_resize {
             self.did_initial_resize = true;
+            crate::platform::trace("First frame drawn");
             let (origin_x, origin_y, screen_w, screen_h) =
                 crate::display::get_main_display_bounds_points();
             let dock_w = 940.0;

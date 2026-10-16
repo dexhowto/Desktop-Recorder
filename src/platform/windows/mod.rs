@@ -91,8 +91,28 @@ pub fn init_log() {
     log_line(&format!("Starting DexHowTo Recorder {}", env!("CARGO_PKG_VERSION")));
 }
 
+/// Logs a native crash (access violation…), which closes the app without a
+/// Rust panic.
+unsafe extern "system" fn log_native_crash(
+    info: *const windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    let record = unsafe { info.as_ref().and_then(|i| i.ExceptionRecord.as_ref()) };
+    match record {
+        Some(r) => log_line(&format!(
+            "Native crash: exception 0x{:08X} at address {:?}",
+            r.ExceptionCode.0 as u32, r.ExceptionAddress
+        )),
+        None => log_line("Native crash (no details)"),
+    }
+    // EXCEPTION_CONTINUE_SEARCH: let Windows end the app as usual
+    0
+}
+
 /// Shows a crash in a message box and the log file instead of closing silently.
 pub fn install_panic_report() {
+    unsafe {
+        windows::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(log_native_crash));
+    }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
