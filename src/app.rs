@@ -613,22 +613,6 @@ impl eframe::App for DexHowToApp {
         self.handle_tray_events(ctx);
         self.recover_from_user_restore(ctx);
 
-        // macOS: keep the overlay above every window (full-screen apps, remote
-        // desktops…) and on every Space. This must run here and not in `ui`:
-        // over another app's full-screen Space the overlay stays hidden until it
-        // becomes a panel, and eframe skips `ui` while the window is hidden.
-        if crate::window::OVERLAY_IN_DOCK {
-            if let Some(overlay) = self.overlay.as_ref() {
-                let d = overlay.display;
-                crate::window::raise_overlay_window((
-                    d.min.x as f64,
-                    d.min.y as f64,
-                    d.width() as f64,
-                    d.height() as f64,
-                ));
-            }
-        }
-
         if matches!(
             self.state,
             AppState::Recording | AppState::CountingDown(_) | AppState::Starting
@@ -675,8 +659,17 @@ impl eframe::App for DexHowToApp {
         };
         let recording = matches!(self.state, AppState::Starting | AppState::Recording);
         if self.overlay.is_some() && crate::window::OVERLAY_IN_DOCK {
-            // Recording: transparent overlay with the countdown and live arrows.
-            // `logic` keeps it above every window and on every Space.
+            // Recording: transparent overlay with the countdown and live arrows
+            // Stay above every window (full-screen apps, remote desktops…) and on every Space
+            if let Some(overlay) = self.overlay.as_ref() {
+                let d = overlay.display;
+                crate::window::raise_overlay_window((
+                    d.min.x as f64,
+                    d.min.y as f64,
+                    d.width() as f64,
+                    d.height() as f64,
+                ));
+            }
             let style = self.prefs.arrows.clone();
             let arrow_key = self.prefs.keys.arrow;
             if let Some(overlay) = self.overlay.as_mut() {
