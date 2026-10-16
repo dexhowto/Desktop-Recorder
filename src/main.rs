@@ -8,6 +8,7 @@ mod audio_merge;
 mod clicks;
 mod config;
 mod editor;
+mod encoding;
 mod focus;
 mod keys;
 mod overlay;

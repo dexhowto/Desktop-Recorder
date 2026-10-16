@@ -1159,6 +1159,8 @@ pub struct VideoEditor {
     pub cursor_style: CursorStyle,
     /// Rings where clicks happened, in the preview and the export
     pub click_style: ClickStyle,
+    /// How the export is encoded (Settings › Defaults › Export video)
+    pub encoding: crate::encoding::ExportEncoding,
     /// The click settings of the last export started, for the app to remember
     pub exported_click_style: Option<ClickStyle>,
 
@@ -1372,6 +1374,7 @@ impl VideoEditor {
             export_dialog_open: false,
             cursor_style: CursorStyle::default(),
             click_style: ClickStyle::default(),
+            encoding: crate::encoding::ExportEncoding::default(),
             exported_click_style: None,
             arrows,
             arrow_style: ArrowStyle::default(),
@@ -1868,6 +1871,7 @@ impl VideoEditor {
             arrow_style: self.arrow_style.clone(),
             clicks: if self.click_style.enabled { self.clicks().to_vec() } else { Vec::new() },
             click_style: self.click_style.clone(),
+            encoding: self.encoding.clone(),
             out_video,
             out_telemetry,
         }));
@@ -2473,6 +2477,7 @@ fn render_export_dialog(ctx: &egui::Context, editor: &mut VideoEditor) {
     let click_count = editor.clicks().len();
     let right_count = editor.clicks().iter().filter(|c| c.kind == ClickKind::Right).count();
     let (video_w, video_h) = (editor.video_width, editor.video_height);
+    let encoding_summary = editor.encoding.summary((video_w, video_h), editor.fps);
     let mut start = false;
     let mut close = false;
 
@@ -2499,6 +2504,8 @@ fn render_export_dialog(ctx: &egui::Context, editor: &mut VideoEditor) {
                 .size(11.5)
                 .color(theme::TEXT_DIM),
             );
+            ui.label(RichText::new(&encoding_summary).size(11.5).color(theme::TEXT_DIM))
+                .on_hover_text("Change in Settings › Defaults › Export video");
             ui.add_space(16.0);
 
             // Scroll when the options are taller than the window

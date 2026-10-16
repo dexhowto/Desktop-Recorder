@@ -341,6 +341,8 @@ pub struct ExportRequest {
     /// effects are off)
     pub clicks: Vec<crate::clicks::Click>,
     pub click_style: crate::clicks::ClickStyle,
+    /// Frame rate, size, data rate, codec and audio of the exported file
+    pub encoding: crate::encoding::ExportEncoding,
     pub out_video: PathBuf,
     pub out_telemetry: PathBuf,
 }
@@ -864,11 +866,19 @@ fn encode(
         video_out = "[vout]".to_string();
     }
 
-    cmd.arg("-filter_complex").arg(&filter).arg("-map").arg(&video_out);
-    if req.has_audio {
-        cmd.arg("-map").arg("[a]").arg("-c:a").arg("aac");
+    // 3. New size and frame rate, when they differ from the recording
+    let resize = req.encoding.output_filters();
+    if !resize.is_empty() {
+        filter.push_str(&format!(";{video_out}{}[vsized]", resize.join(",")));
+        video_out = "[vsized]".to_string();
     }
-    cmd.args(crate::platform::h264_encoder_args())
+
+    cmd.arg("-filter_complex").arg(&filter).arg("-map").arg(&video_out);
+    if req.has_audio && req.encoding.encode_audio {
+        cmd.arg("-map").arg("[a]").args(req.encoding.audio_args());
+    }
+    let hevc = req.encoding.codec == crate::encoding::VideoCodec::Hevc;
+    cmd.args(req.encoding.video_args(crate::platform::video_encoder(hevc)))
         .arg("-progress")
         .arg("pipe:1")
         .arg("-nostats")
@@ -982,6 +992,7 @@ mod tests {
                 Click { t: 1.1, norm: (0.75, 0.5), kind: ClickKind::Right },
             ],
             click_style: style.clone(),
+            encoding: Default::default(),
             out_video: out.clone(),
             out_telemetry: dir.join("out.mouse.jsonl"),
         };

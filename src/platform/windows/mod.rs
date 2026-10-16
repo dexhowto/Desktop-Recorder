@@ -133,9 +133,9 @@ pub fn install_panic_report() {
     }));
 }
 
-/// ffmpeg arguments for H.264 at export: the Media Foundation encoder when it
-/// works on this PC, otherwise libx264.
-pub fn ffmpeg_h264_encoder_args() -> Vec<&'static str> {
+/// ffmpeg encoder at export: Media Foundation when it works on this PC,
+/// otherwise libx264 (H.264) or libx265 (HEVC).
+pub fn ffmpeg_video_encoder(hevc: bool) -> &'static str {
     static HAS_MF: OnceLock<bool> = OnceLock::new();
     let has_mf = *HAS_MF.get_or_init(|| {
         // An ffmpeg build can list h264_mf although Media Foundation cannot
@@ -153,9 +153,10 @@ pub fn ffmpeg_h264_encoder_args() -> Vec<&'static str> {
         ));
         works
     });
-    if has_mf {
-        vec!["-c:v", "h264_mf", "-b:v", "15M"]
-    } else {
-        vec!["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+    match (has_mf, hevc) {
+        (true, false) => "h264_mf",
+        (true, true) => "hevc_mf",
+        (false, false) => "libx264",
+        (false, true) => "libx265",
     }
 }

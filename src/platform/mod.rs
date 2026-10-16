@@ -119,14 +119,14 @@ pub fn app_support_dir() -> PathBuf {
     }
 }
 
-/// ffmpeg arguments for the hardware H.264 encoder used at export.
-pub fn h264_encoder_args() -> Vec<&'static str> {
+/// ffmpeg video encoder used at export: H.264, or HEVC when `hevc` is true.
+pub fn video_encoder(hevc: bool) -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        vec!["-c:v", "h264_videotoolbox", "-b:v", "15M"]
+        if hevc { "hevc_videotoolbox" } else { "h264_videotoolbox" }
     }
     #[cfg(windows)]
     {
-        self::windows::ffmpeg_h264_encoder_args()
+        self::windows::ffmpeg_video_encoder(hevc)
     }
 }

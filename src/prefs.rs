@@ -28,6 +28,8 @@ pub struct Preferences {
     pub keys: crate::keys::KeyBindings,
     /// Turn on Clean Move when a recording opens in the editor
     pub clean_move: bool,
+    /// Frame rate, size, data rate, codec and audio of every export
+    pub export_encoding: crate::encoding::ExportEncoding,
 }
 
 fn settings_path() -> PathBuf {

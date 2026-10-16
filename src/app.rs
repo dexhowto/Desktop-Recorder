@@ -591,6 +591,10 @@ impl DexHowToApp {
             format,
             output_dir
         );
+        // An open editor exports with the new encoding settings right away
+        if let Some(editor) = self.editor.as_mut() {
+            editor.encoding = self.prefs.export_encoding.clone();
+        }
         // An open editor reads arrows and Clean Move with the new keys right away
         if self.prefs.keys != self.saved_prefs.keys {
             if let Some(editor) = self.editor.as_mut() {
@@ -865,6 +869,7 @@ fn open_editor(
     editor.cursor_style = prefs.export_cursor.clone();
     editor.arrow_style = prefs.arrows.clone();
     editor.click_style = prefs.export_clicks.clone();
+    editor.encoding = prefs.export_encoding.clone();
     editor.set_key_bindings(prefs.keys.clone());
     if prefs.clean_move {
         // Recordings without telemetry have nothing to clean, so the error is ignored
@@ -2242,12 +2247,140 @@ fn settings_defaults_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
         });
     });
 
+    settings_export_encoding(ui, &mut app.prefs.export_encoding);
+
     ui.horizontal(|ui| {
         if button(ui, ButtonKind::Ghost, "Reset to factory defaults", true)
             .on_hover_text("Restore every setting, including the save folder")
             .clicked()
         {
             app.prefs = crate::prefs::Preferences::default();
+        }
+    });
+}
+
+/// Export video and audio encoding, used by every export from the editor.
+fn settings_export_encoding(ui: &mut egui::Ui, enc: &mut crate::encoding::ExportEncoding) {
+    use crate::encoding::{Entropy, FitMode, H264Profile, VideoCodec, FRAME_RATES, SIZES};
+
+    // Automatic / Custom choice for a data rate, with a slider when custom
+    fn data_rate(ui: &mut egui::Ui, kbps: &mut Option<u32>, range: std::ops::RangeInclusive<u32>, custom_default: u32) {
+        let mut custom = kbps.is_some();
+        if segmented(ui, &mut custom, &[(false, "Automatic"), (true, "Custom")]) {
+            *kbps = custom.then_some(custom_default);
+        }
+        if let Some(value) = kbps.as_mut() {
+            ui.spacing_mut().slider_width = 160.0;
+            ui.add(egui::Slider::new(value, range).logarithmic(true).suffix(" kbit/s"));
+        }
+    }
+
+    settings_group(ui, "EXPORT VIDEO", |ui| {
+        setting_row(ui, "Frame rate", "Automatic keeps the recording's frame rate.", 200.0, |ui| {
+            egui::ComboBox::from_id_salt("export_frame_rate")
+                .selected_text(enc.frame_rate.map_or("Automatic".to_string(), |f| format!("{f} fps")))
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut enc.frame_rate, None, "Automatic");
+                    for f in FRAME_RATES {
+                        ui.selectable_value(&mut enc.frame_rate, Some(f), format!("{f} fps"));
+                    }
+                });
+        });
+        row_separator(ui);
+        setting_row(ui, "Dimensions", "Size of the exported video.", 200.0, |ui| {
+            let label = |size: Option<(u32, u32)>| match size {
+                None => "Same as recording".to_string(),
+                Some((w, h)) => SIZES
+                    .iter()
+                    .find(|s| (s.0, s.1) == (w, h))
+                    .map_or(format!("{w} × {h}"), |s| s.2.to_string()),
+            };
+            egui::ComboBox::from_id_salt("export_size")
+                .selected_text(label(enc.size))
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut enc.size, None, label(None));
+                    for (w, h, name) in SIZES {
+                        ui.selectable_value(&mut enc.size, Some((w, h)), name);
+                    }
+                });
+        });
+        if enc.size.is_some() {
+            row_separator(ui);
+            setting_row(ui, "Preserve aspect ratio", "Off stretches the video to the size.", 60.0, |ui| {
+                settings_toggle(ui, &mut enc.preserve_aspect);
+            });
+            if enc.preserve_aspect {
+                row_separator(ui);
+                setting_row(ui, "Fit", "", 200.0, |ui| {
+                    let label = |fit: FitMode| match fit {
+                        FitMode::FitWithin => "Fit within size",
+                        FitMode::Letterbox => "Fit with black bars",
+                        FitMode::Crop => "Crop to fill",
+                    };
+                    egui::ComboBox::from_id_salt("export_fit")
+                        .selected_text(label(enc.fit))
+                        .width(170.0)
+                        .show_ui(ui, |ui| {
+                            for fit in [FitMode::FitWithin, FitMode::Letterbox, FitMode::Crop] {
+                                ui.selectable_value(&mut enc.fit, fit, label(fit));
+                            }
+                        });
+                });
+            }
+        }
+        row_separator(ui);
+        setting_row(ui, "Data rate", "Higher looks sharper and makes a bigger file.", 380.0, |ui| {
+            // Right-to-left row: the slider is added first so it ends up on the right
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                data_rate(ui, &mut enc.video_kbps, crate::encoding::VIDEO_KBPS_RANGE, 6000);
+            });
+        });
+        row_separator(ui);
+        setting_row(ui, "Compression type", "HEVC makes smaller files; older players may not open them.", 200.0, |ui| {
+            segmented(ui, &mut enc.codec, &[(VideoCodec::H264, "H.264"), (VideoCodec::Hevc, "HEVC")]);
+        });
+        row_separator(ui);
+        setting_row(ui, "Keyframe every", "A full picture every this many frames. Lower seeks faster, higher makes smaller files.", 200.0, |ui| {
+            ui.add(egui::DragValue::new(&mut enc.keyframe_every).range(1..=600).suffix(" frames"));
+        });
+        if enc.codec == VideoCodec::H264 {
+            row_separator(ui);
+            setting_row(ui, "Profile", "High gives the smallest file; Baseline plays on the oldest devices.", 260.0, |ui| {
+                segmented(
+                    ui,
+                    &mut enc.profile,
+                    &[(H264Profile::Baseline, "Baseline"), (H264Profile::Main, "Main"), (H264Profile::High, "High")],
+                );
+            });
+            row_separator(ui);
+            let baseline = enc.profile == H264Profile::Baseline;
+            setting_row(
+                ui,
+                "Entropy",
+                if baseline { "Baseline always uses CAVLC." } else { "CABAC makes smaller files." },
+                200.0,
+                |ui| {
+                    ui.add_enabled_ui(!baseline, |ui| {
+                        segmented(ui, &mut enc.entropy, &[(Entropy::Cabac, "CABAC"), (Entropy::Cavlc, "CAVLC")]);
+                    });
+                },
+            );
+        }
+    });
+
+    settings_group(ui, "EXPORT AUDIO", |ui| {
+        setting_row(ui, "Encode audio", "Off exports the video without sound.", 60.0, |ui| {
+            settings_toggle(ui, &mut enc.encode_audio);
+        });
+        if enc.encode_audio {
+            row_separator(ui);
+            setting_row(ui, "Data rate", "AAC. Automatic is 128 kbit/s.", 380.0, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    data_rate(ui, &mut enc.audio_kbps, crate::encoding::AUDIO_KBPS_RANGE, 192);
+                });
+            });
         }
     });
 }
