@@ -1,4 +1,4 @@
-DexHowTo Recorder for Windows (beta, x64)
+DexHowTo Recorder for Windows (x64)
 
 Run "DexHowTo Recorder.exe". It needs Windows 10 2004 or later, or Windows 11.
 On Windows 11 for ARM (for example in UTM on a Mac) it runs through x64 emulation.
