@@ -9,8 +9,15 @@
 - Mouse and keyboard telemetry (GetCursorPos, GetAsyncKeyState) in the same
   `.mouse.jsonl` format. Coordinates are physical pixels, so they match the video.
   The Windows key is written as `cmd`, Alt as `alt`.
-- Live overlay while recording: topmost, click-through, and left out of the video
-  with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
+- Live overlay while recording: a native window drawn on the CPU with per-pixel
+  alpha (UpdateLayeredWindow), topmost and click-through. The dock stays visible
+  (opaque, rounded by Windows 11) with its Stop button. All of the app's windows are
+  left out of the video with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
+- Graphics: wgpu on Direct3D 12 only (Vulkan crashed under x64 emulation on
+  Windows for ARM). A start that crashes while opening the window makes the next
+  start use OpenGL. `--glow` forces OpenGL; `WGPU_BACKEND` overrides the backend.
+- `log.txt` next to the exe lists the startup steps and errors
+  (`log.previous.txt` holds the run before).
 - Editor and export. Export uses `h264_mf` when the ffmpeg build has it, otherwise
   `libx264`.
 - "Show in Explorer" / "Play" use explorer.

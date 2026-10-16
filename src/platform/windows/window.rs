@@ -1,32 +1,38 @@
-//! Native window tweaks for the recording overlay on Windows.
+//! Native window tweaks while recording on Windows.
 //!
-//! egui/winit already make the overlay click-through (`MousePassthrough` sets
-//! `WS_EX_LAYERED | WS_EX_TRANSPARENT`) and topmost (`WindowLevel::AlwaysOnTop`).
-//! This module keeps it above windows that become topmost later, and leaves
-//! this app's windows out of the recording with
+//! Unlike on macOS, the dock does not turn into the overlay: it stays as it is
+//! (topmost, with its Stop button), and the countdown and live arrows are drawn
+//! in a separate native window (`overlay_window.rs`). Every window of the app
+//! is left out of the recording with
 //! `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (Windows 10 2004+).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, SetWindowDisplayAffinity, SetWindowPos,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
 };
 use windows::core::BOOL;
 
-/// Title of the main (dock / overlay) window, set in `main.rs`.
+use super::overlay_window::OverlayWindow;
+use crate::overlay::OverlayScene;
+
+/// The dock window stays a dock; the overlay is its own native window.
+pub const OVERLAY_IN_DOCK: bool = false;
+
+/// Title of the main (dock) window, set in `main.rs`.
 const MAIN_WINDOW_TITLE: &str = "DexHowTo Recorder";
 
-/// How often to put the overlay back on top and re-apply the capture exclusion
+/// How often to put the windows back on top and re-apply the capture exclusion
 /// (new windows such as Settings may have opened).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
 thread_local! {
     static EXCLUDE: Cell<bool> = const { Cell::new(false) };
     static LAST_REFRESH: Cell<Option<Instant>> = const { Cell::new(None) };
+    static OVERLAY: RefCell<Option<OverlayWindow>> = const { RefCell::new(None) };
 }
 
 /// Top-level windows of this process.
@@ -53,13 +59,44 @@ fn title(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..len.min(buf.len())])
 }
 
-/// The app's main window (the dock, which becomes the overlay while recording).
+/// The app's main window (the dock).
 fn main_window() -> Option<HWND> {
     own_windows().into_iter().find(|h| title(*h) == MAIN_WINDOW_TITLE)
 }
 
+fn set_topmost(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Rounds the opaque dock's corners (Windows 11; ignored on Windows 10).
+pub fn style_dock() {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
+    let Some(hwnd) = main_window() else {
+        return;
+    };
+    let round = DWMWCP_ROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const round).cast(),
+            std::mem::size_of_val(&round) as u32,
+        );
+    }
+}
+
 /// Leaves this app's windows out of the recording (or puts them back in).
-/// Applied to every window of the app while the overlay is shown.
+/// Applied to every window of the app while recording.
 pub fn set_exclude_from_capture(exclude: bool) {
     EXCLUDE.set(exclude);
     LAST_REFRESH.set(None);
@@ -68,94 +105,74 @@ pub fn set_exclude_from_capture(exclude: bool) {
 fn apply_capture_affinity(exclude: bool) {
     let affinity = if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
     for hwnd in own_windows() {
-        // Fails before Windows 10 2004; the overlay is then recorded too
+        // Fails before Windows 10 2004; the windows are then recorded too
         if let Err(e) = unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
             if exclude {
-                eprintln!("Warning: could not leave the overlay out of the recording: {e}");
+                super::log_line(&format!("Could not leave a window out of the recording: {e}"));
             }
         }
     }
 }
 
-/// The recorded monitor's rectangle in physical pixels, from its bounds in points.
-fn display_rect_pixels(display: (f64, f64, f64, f64)) -> Option<RECT> {
+/// The recorded monitor in physical pixels and its scale, from its bounds in points.
+fn display_monitor(display: (f64, f64, f64, f64)) -> Option<(RECT, f32)> {
     let (x, y, _, _) = display;
     super::display::monitors()
         .into_iter()
         .find(|m| {
             (m.rect.left as f64 / m.scale - x).abs() < 1.0 && (m.rect.top as f64 / m.scale - y).abs() < 1.0
         })
-        .map(|m| m.rect)
+        .map(|m| (m.rect, m.scale as f32))
 }
 
-/// Keeps the overlay topmost, click-through, never focused, out of the
-/// recording and exactly over the recorded display. `display` is that display
-/// in points (x, y, width, height). Cheap; call every frame while the overlay
-/// is shown.
-pub fn raise_overlay_window(display: (f64, f64, f64, f64)) {
+/// Keeps the dock and the overlay on top and out of the recording. `display` is
+/// the recorded display in points (x, y, width, height). Cheap; call every
+/// frame while recording.
+pub fn raise_overlay_window(_display: (f64, f64, f64, f64)) {
     let due = LAST_REFRESH.get().is_none_or(|t| t.elapsed() >= REFRESH_INTERVAL);
     if !due {
         return;
     }
     LAST_REFRESH.set(Some(Instant::now()));
-    let Some(hwnd) = main_window() else {
-        return;
-    };
-    unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        // Click-through needs both flags; winit sets them, this only checks.
-        // Never focused, so the app being recorded keeps the keyboard.
-        let wanted = ex | (WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0) as isize;
-        if wanted != ex {
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted);
-        }
-        // winit converts the position egui asked for with the scale of the
-        // monitor the dock was on, which is off when the recorded monitor has
-        // another scale. Place the window in physical pixels instead.
-        let mut current = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut current);
-        let target = display_rect_pixels(display).filter(|r| *r != current);
-        // Above windows that became topmost after the overlay
-        match target {
-            Some(r) => {
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOACTIVATE,
-                );
-            }
-            None => {
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-        }
+    if let Some(hwnd) = main_window() {
+        set_topmost(hwnd);
     }
+    OVERLAY.with_borrow(|o| {
+        if let Some(o) = o {
+            o.raise();
+        }
+    });
     apply_capture_affinity(EXCLUDE.get());
 }
 
-/// Makes the main window an ordinary window again (after recording).
-pub fn restore_normal_window() {
-    LAST_REFRESH.set(None);
-    if let Some(hwnd) = main_window() {
-        unsafe {
-            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let normal = ex & !(WS_EX_NOACTIVATE.0 as isize);
-            if normal != ex {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, normal);
+/// Draws `scene` in the overlay over `display` (points), creating the overlay
+/// window the first time.
+pub fn show_overlay(display: (f64, f64, f64, f64), scene: &OverlayScene) {
+    let Some((rect, scale)) = display_monitor(display) else {
+        return;
+    };
+    OVERLAY.with_borrow_mut(|slot| {
+        if slot.as_ref().is_none_or(|o| !o.covers(rect)) {
+            *slot = OverlayWindow::new(rect, scale);
+            match slot {
+                Some(o) => {
+                    if EXCLUDE.get() {
+                        let _ = unsafe { SetWindowDisplayAffinity(o.hwnd(), WDA_EXCLUDEFROMCAPTURE) };
+                    }
+                }
+                None => super::log_line("Could not create the overlay window"),
             }
         }
-    }
+        if let Some(o) = slot.as_mut() {
+            o.draw(scene);
+        }
+    });
+}
+
+/// Removes the overlay and makes the dock an ordinary window again (after recording).
+pub fn restore_normal_window() {
+    LAST_REFRESH.set(None);
+    OVERLAY.with_borrow_mut(|slot| *slot = None);
     if EXCLUDE.replace(false) {
         apply_capture_affinity(false);
     }

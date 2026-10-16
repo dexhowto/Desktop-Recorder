@@ -170,6 +170,15 @@ pub fn raise_overlay_window(display: (f64, f64, f64, f64)) {
     }
 }
 
+/// On macOS the dock window itself becomes the overlay while recording.
+pub const OVERLAY_IN_DOCK: bool = true;
+
+/// Nothing to do: the dock draws its own rounded, transparent panel.
+pub fn style_dock() {}
+
+/// Not used on macOS: the overlay is drawn in the dock window (`OVERLAY_IN_DOCK`).
+pub fn show_overlay(_display: (f64, f64, f64, f64), _scene: &crate::overlay::OverlayScene) {}
+
 /// macOS leaves this app out of the recording in the capture filter instead
 /// (see `screen_capture`), so there is nothing to do here.
 pub fn set_exclude_from_capture(_exclude: bool) {}

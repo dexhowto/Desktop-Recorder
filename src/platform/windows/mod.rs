@@ -8,6 +8,7 @@ pub mod av_access;
 pub mod camera_capture;
 pub mod display;
 pub mod mic_capture;
+pub mod overlay_window;
 pub mod screen_capture;
 pub mod startup;
 pub mod window;

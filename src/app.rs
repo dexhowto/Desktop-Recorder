@@ -438,6 +438,10 @@ impl DexHowToApp {
         self.overlay = Some(crate::overlay::LiveOverlay::new(display));
         crate::window::set_exclude_from_capture(!self.config.record_own_windows);
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        if !crate::window::OVERLAY_IN_DOCK {
+            // Windows: the dock stays a dock; the overlay is a native window
+            return;
+        }
         ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(display.min));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(display.size()));
@@ -449,8 +453,12 @@ impl DexHowToApp {
             return;
         }
         crate::window::restore_normal_window();
-        ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        if !crate::window::OVERLAY_IN_DOCK {
+            self.dock_position_before_overlay = None;
+            return;
+        }
+        ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(940.0, 210.0)));
         let position = self.dock_position_before_overlay.take().unwrap_or_else(|| {
             let (ox, oy, sw, sh) = crate::display::get_main_display_bounds_points();
@@ -591,7 +599,12 @@ impl eframe::App for DexHowToApp {
     /// Fully transparent window background: the dock draws its own rounded panel,
     /// and while recording the window is an invisible overlay over the screen.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        if crate::window::OVERLAY_IN_DOCK {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            // Windows: an opaque dock (the system rounds its corners)
+            theme::PANEL.to_normalized_gamma_f32()
+        }
     }
 
     /// Called continuously by eframe even when the window is minimized or hidden
@@ -615,6 +628,7 @@ impl eframe::App for DexHowToApp {
         if !self.did_initial_resize {
             self.did_initial_resize = true;
             crate::platform::first_frame_drawn();
+            crate::window::style_dock();
             let (origin_x, origin_y, screen_w, screen_h) =
                 crate::display::get_main_display_bounds_points();
             let dock_w = 940.0;
@@ -639,13 +653,13 @@ impl eframe::App for DexHowToApp {
 
         // Any empty part of the dock moves the window, like a normal Mac window
         // background. Registered first, so every widget drawn later sits on top of it.
-        if self.overlay.is_some() {
+        let countdown = match self.state {
+            AppState::CountingDown(s) => Some(s),
+            _ => None,
+        };
+        let recording = matches!(self.state, AppState::Starting | AppState::Recording);
+        if self.overlay.is_some() && crate::window::OVERLAY_IN_DOCK {
             // Recording: transparent overlay with the countdown and live arrows
-            let countdown = match self.state {
-                AppState::CountingDown(s) => Some(s),
-                _ => None,
-            };
-            let recording = matches!(self.state, AppState::Starting | AppState::Recording);
             // Stay above every window (full-screen apps, remote desktops…) and on every Space
             if let Some(overlay) = self.overlay.as_ref() {
                 let d = overlay.display;
@@ -664,6 +678,16 @@ impl eframe::App for DexHowToApp {
                     .show(ui, |ui| overlay.show(ui, countdown, recording, &style, arrow_key));
             }
         } else {
+            // Windows: the overlay is a native window next to the dock
+            if let Some(overlay) = self.overlay.as_mut() {
+                let d = overlay.display;
+                let bounds = (d.min.x as f64, d.min.y as f64, d.width() as f64, d.height() as f64);
+                crate::window::raise_overlay_window(bounds);
+                let style = &self.prefs.arrows;
+                overlay.update(d.min, recording, style, self.prefs.keys.arrow);
+                crate::window::show_overlay(bounds, &overlay.scene(countdown, recording, style));
+                ctx.request_repaint_after(Duration::from_millis(overlay.repaint_ms(countdown)));
+            }
             self.update_window_drag(&ctx);
             let background = ui.interact(
                 ui.max_rect(),
@@ -678,7 +702,7 @@ impl eframe::App for DexHowToApp {
                     egui::Frame::new()
                         .fill(theme::PANEL)
                         .stroke(Stroke::new(1.0, theme::BORDER))
-                        .corner_radius(16.0)
+                        .corner_radius(if crate::window::OVERLAY_IN_DOCK { 16.0 } else { 8.0 })
                         .inner_margin(Margin::symmetric(14, 10)),
                 )
                 .show(ui, |ui| {

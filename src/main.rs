@@ -84,13 +84,6 @@ fn run_windows(native_options: eframe::NativeOptions) -> eframe::Result<()> {
         if backend.is_none() {
             setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
         }
-        // A swapchain on the window handle is always opaque: the dock corners
-        // and the whole recording overlay would be black. DirectComposition
-        // supports transparency. WGPU_DX12_PRESENTATION_SYSTEM=hwnd overrides it.
-        if std::env::var_os("WGPU_DX12_PRESENTATION_SYSTEM").is_none() {
-            setup.instance_descriptor.backend_options.dx12.presentation_system =
-                eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
-        }
     }
     log_line(&format!(
         "Opening the window with wgpu ({})",
@@ -133,7 +126,9 @@ fn native_options() -> eframe::NativeOptions {
             .with_min_inner_size([860.0, 200.0])
             .with_position([dock_x, dock_y])
             .with_decorations(false)
-            .with_transparent(true)
+            // Windows: transparent wgpu windows show white or black there, so the
+            // dock is opaque and the overlay is a native window (see `window`)
+            .with_transparent(crate::window::OVERLAY_IN_DOCK)
             .with_title("DexHowTo Recorder")
             .with_icon(ui_kit::app_icon()),
         ..Default::default()
