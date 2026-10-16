@@ -80,9 +80,16 @@ fn run_windows(native_options: eframe::NativeOptions) -> eframe::Result<()> {
     let mut options = native_options;
     options.renderer = eframe::Renderer::Wgpu;
     let backend = std::env::var("WGPU_BACKEND").ok();
-    if backend.is_none() {
-        if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        if backend.is_none() {
             setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        }
+        // A swapchain on the window handle is always opaque: the dock corners
+        // and the whole recording overlay would be black. DirectComposition
+        // supports transparency. WGPU_DX12_PRESENTATION_SYSTEM=hwnd overrides it.
+        if std::env::var_os("WGPU_DX12_PRESENTATION_SYSTEM").is_none() {
+            setup.instance_descriptor.backend_options.dx12.presentation_system =
+                eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
         }
     }
     log_line(&format!(
