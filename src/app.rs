@@ -614,7 +614,7 @@ impl eframe::App for DexHowToApp {
         // Enforce ideal window geometry and bottom position on startup
         if !self.did_initial_resize {
             self.did_initial_resize = true;
-            crate::platform::trace("First frame drawn");
+            crate::platform::first_frame_drawn();
             let (origin_x, origin_y, screen_w, screen_h) =
                 crate::display::get_main_display_bounds_points();
             let dock_w = 940.0;

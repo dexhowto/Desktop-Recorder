@@ -50,6 +50,13 @@ pub fn trace(step: &str) {
     let _ = step;
 }
 
+/// The first frame is on screen: the window opened without a crash.
+pub fn first_frame_drawn() {
+    trace("First frame drawn");
+    #[cfg(windows)]
+    self::windows::startup::clear();
+}
+
 /// A command that never opens a console window (ffmpeg, ffprobe…).
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     #[allow(unused_mut)]

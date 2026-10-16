@@ -9,6 +9,7 @@ pub mod camera_capture;
 pub mod display;
 pub mod mic_capture;
 pub mod screen_capture;
+pub mod startup;
 pub mod window;
 
 use std::io::Write;
@@ -32,6 +33,10 @@ fn log_file() -> &'static (std::path::PathBuf, std::sync::Mutex<Option<std::fs::
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("log.txt")));
         let fallback = crate::platform::app_support_dir().join("log.txt");
+        // Keep the previous run's log, which may hold why it closed
+        let beside_exe = beside_exe.inspect(|path| {
+            let _ = std::fs::rename(path, path.with_file_name("log.previous.txt"));
+        });
         let opened = beside_exe.and_then(create).or_else(|| {
             let _ = std::fs::create_dir_all(crate::platform::app_support_dir());
             create(fallback.clone())

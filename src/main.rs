@@ -35,44 +35,80 @@ fn main() -> eframe::Result<()> {
     let native_options = native_options();
 
     #[cfg(windows)]
-    {
-        // wgpu (Direct3D 12 / Vulkan) first; OpenGL when no GPU adapter works.
-        // `--glow` starts with OpenGL; WGPU_BACKEND=dx12|vulkan|gl picks the wgpu backend.
-        if std::env::args().any(|a| a == "--glow") {
-            let mut options = native_options;
-            options.renderer = eframe::Renderer::Glow;
-            platform::trace("Opening the window with OpenGL (--glow)");
-            let result = run(options);
-            if let Err(e) = &result {
-                platform::windows::report_fatal(&format!("DexHowTo Recorder could not open its window.\n\nOpenGL: {e}"));
-            }
-            return result;
-        }
-        let mut options = native_options;
-        options.renderer = eframe::Renderer::Wgpu;
-        platform::trace(&format!(
-            "Opening the window with wgpu (WGPU_BACKEND={})",
-            std::env::var("WGPU_BACKEND").unwrap_or_else(|_| "default".to_string())
-        ));
-        let first = run(options);
-        let Err(wgpu_error) = first else {
-            return first;
-        };
-        platform::windows::log_line(&format!("wgpu renderer failed: {wgpu_error}"));
-        let mut options = self::native_options();
-        options.renderer = eframe::Renderer::Glow;
-        platform::trace("Opening the window with OpenGL");
-        let second = run(options);
-        if let Err(glow_error) = &second {
-            platform::windows::report_fatal(&format!(
-                "DexHowTo Recorder could not open its window.\n\n\
-                 Direct3D/Vulkan: {wgpu_error}\nOpenGL: {glow_error}"
-            ));
-        }
-        second
-    }
+    return run_windows(native_options);
     #[cfg(not(windows))]
     run(native_options)
+}
+
+/// Opens the window on Windows, where graphics setup can crash the whole app
+/// in a VM or with a broken driver.
+///
+/// wgpu is limited to Direct3D 12 (with its software fallback, WARP), because
+/// probing Vulkan drivers crashed under x64 emulation on Windows for ARM.
+/// A start that crashes before its first frame is remembered, and the next
+/// start uses OpenGL. `--glow` forces OpenGL; WGPU_BACKEND=dx12|vulkan|gl
+/// overrides the wgpu backend.
+#[cfg(windows)]
+fn run_windows(native_options: eframe::NativeOptions) -> eframe::Result<()> {
+    use platform::windows::{log_line, report_fatal, startup};
+
+    let crashed = startup::previous_crash();
+    let use_glow = std::env::args().any(|a| a == "--glow") || crashed == Some(startup::Renderer::Wgpu);
+    if crashed == Some(startup::Renderer::Glow) {
+        report_fatal(
+            "DexHowTo Recorder closed while opening its window, with Direct3D and with OpenGL.\n\n\
+             It will try Direct3D again now.",
+        );
+    }
+
+    if use_glow {
+        if crashed == Some(startup::Renderer::Wgpu) {
+            log_line("The last start crashed with Direct3D, using OpenGL");
+        }
+        let mut options = native_options;
+        options.renderer = eframe::Renderer::Glow;
+        log_line("Opening the window with OpenGL");
+        startup::attempt(startup::Renderer::Glow);
+        let result = run(options);
+        if let Err(e) = &result {
+            startup::clear();
+            report_fatal(&format!("DexHowTo Recorder could not open its window.\n\nOpenGL: {e}"));
+        }
+        return result;
+    }
+
+    let mut options = native_options;
+    options.renderer = eframe::Renderer::Wgpu;
+    let backend = std::env::var("WGPU_BACKEND").ok();
+    if backend.is_none() {
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+            setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        }
+    }
+    log_line(&format!(
+        "Opening the window with wgpu ({})",
+        backend.as_deref().unwrap_or("dx12")
+    ));
+    startup::attempt(startup::Renderer::Wgpu);
+    let first = run(options);
+    let Err(wgpu_error) = first else {
+        return first;
+    };
+    log_line(&format!("wgpu renderer failed: {wgpu_error}"));
+
+    let mut options = self::native_options();
+    options.renderer = eframe::Renderer::Glow;
+    log_line("Opening the window with OpenGL");
+    startup::attempt(startup::Renderer::Glow);
+    let second = run(options);
+    if let Err(glow_error) = &second {
+        startup::clear();
+        report_fatal(&format!(
+            "DexHowTo Recorder could not open its window.\n\n\
+             Direct3D: {wgpu_error}\nOpenGL: {glow_error}"
+        ));
+    }
+    second
 }
 
 fn native_options() -> eframe::NativeOptions {
