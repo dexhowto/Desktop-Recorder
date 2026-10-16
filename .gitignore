@@ -2,3 +2,4 @@
 # Built by bundle.sh
 /DexHowTo Recorder.app
 .DS_Store
+/dist
