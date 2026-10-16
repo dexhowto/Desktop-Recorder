@@ -1,5 +1,6 @@
 // No console window next to the app in release builds on Windows
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// (build with `--features console` to keep it for log output)
+#![cfg_attr(all(windows, not(debug_assertions), not(feature = "console")), windows_subsystem = "windows")]
 
 mod app;
 mod arrows;
@@ -24,13 +25,45 @@ use app::DexHowToApp;
 
 fn main() -> eframe::Result<()> {
     platform::init();
+    let native_options = native_options();
+
+    #[cfg(windows)]
+    {
+        // Without a console, a failure would close the app without a word:
+        // report it in a message box and in the log file instead.
+        platform::windows::init_log();
+        platform::windows::install_panic_report();
+        // wgpu (Direct3D 12 / Vulkan) first; OpenGL when no GPU adapter works
+        let mut options = native_options;
+        options.renderer = eframe::Renderer::Wgpu;
+        let first = run(options);
+        let Err(wgpu_error) = first else {
+            return first;
+        };
+        platform::windows::log_line(&format!("wgpu renderer failed: {wgpu_error}"));
+        let mut options = self::native_options();
+        options.renderer = eframe::Renderer::Glow;
+        let second = run(options);
+        if let Err(glow_error) = &second {
+            platform::windows::report_fatal(&format!(
+                "DexHowTo Recorder could not open its window.\n\n\
+                 Direct3D/Vulkan: {wgpu_error}\nOpenGL: {glow_error}"
+            ));
+        }
+        second
+    }
+    #[cfg(not(windows))]
+    run(native_options)
+}
+
+fn native_options() -> eframe::NativeOptions {
     let (origin_x, origin_y, screen_w, screen_h) = crate::display::get_main_display_bounds_points();
     let dock_w = 940.0;
     let dock_h = 210.0;
     let dock_x = origin_x + (screen_w - dock_w) / 2.0;
     let dock_y = origin_y + (screen_h - dock_h - 115.0).max(20.0);
 
-    let native_options = eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([dock_w, dock_h])
             .with_min_inner_size([860.0, 200.0])
@@ -40,8 +73,10 @@ fn main() -> eframe::Result<()> {
             .with_title("DexHowTo Recorder")
             .with_icon(ui_kit::app_icon()),
         ..Default::default()
-    };
+    }
+}
 
+fn run(native_options: eframe::NativeOptions) -> eframe::Result<()> {
     eframe::run_native(
         "DexHowTo Recorder",
         native_options,

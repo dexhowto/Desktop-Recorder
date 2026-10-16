@@ -18,8 +18,15 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 screencapturekit = { version = "11.0.0", features = ["macos_15_0"] }
 
+[features]
+# Windows: keep the console window, to see log output and panics
+console = []
+
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"
+# OpenGL as a fallback renderer when Direct3D/Vulkan (wgpu) cannot start, e.g. in a VM
+eframe = { version = "0.36.2", features = ["glow"] }
+log = "0.4"
 windows-capture = "2.0.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
