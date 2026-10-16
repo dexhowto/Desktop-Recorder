@@ -14,10 +14,20 @@ pub mod window;
 use std::io::Write;
 use std::sync::OnceLock;
 
-/// Log file for errors, since release builds have no console:
-/// `%APPDATA%\DexHowTo Recorder\log.txt`.
+/// Log file for errors, since release builds have no console: `log.txt` next
+/// to the exe, or `%APPDATA%\DexHowTo Recorder\log.txt` when that folder is
+/// not writable.
 pub fn log_path() -> std::path::PathBuf {
-    crate::platform::app_support_dir().join("log.txt")
+    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let beside_exe = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("log.txt")));
+        beside_exe
+            .filter(|path| std::fs::OpenOptions::new().create(true).append(true).open(path).is_ok())
+            .unwrap_or_else(|| crate::platform::app_support_dir().join("log.txt"))
+    })
+    .clone()
 }
 
 /// Appends a line to the log file (and to the console, when there is one).
