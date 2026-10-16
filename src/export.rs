@@ -488,7 +488,7 @@ fn render_arrow_growth(
     let frames = (duration * ARROW_ANIM_FPS).ceil() as usize;
     let path = tmp.join(format!("arrow{index}_grow.mov"));
 
-    let mut encoder = Command::new(crate::editor::find_ffmpeg_bin())
+    let mut encoder = crate::platform::command(crate::editor::find_ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
         .args(["-s", &format!("{width}x{height}")])
@@ -616,7 +616,7 @@ fn encode(
     tmp: &Path,
     out_duration: f64,
 ) -> Result<(), String> {
-    let mut cmd = Command::new(crate::editor::find_ffmpeg_bin());
+    let mut cmd = crate::platform::command(crate::editor::find_ffmpeg_bin());
     cmd.arg("-y").arg("-i").arg(&req.video_path);
 
     // 1. Cut: trim every kept segment and join them.
@@ -750,7 +750,13 @@ fn encode(
             });
             let cmd_path = tmp.join("cursor.cmd");
             write_cursor_commands(&cmd_path, req, tel, &cursor, highlight.as_ref(), out_duration)?;
-            let cmd_arg = cmd_path.to_string_lossy().replace('\\', "/").replace('\'', "");
+            // Inside the filter, ':' separates options, so a Windows drive
+            // letter ("C:/…") must be escaped
+            let cmd_arg = cmd_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace('\'', "")
+                .replace(':', "\\:");
 
             filter.push_str(&format!(";{base}sendcmd=f='{cmd_arg}'[vcmd]"));
             base = "[vcmd]".to_string();
@@ -776,10 +782,7 @@ fn encode(
     if req.has_audio {
         cmd.arg("-map").arg("[a]").arg("-c:a").arg("aac");
     }
-    cmd.arg("-c:v")
-        .arg("h264_videotoolbox")
-        .arg("-b:v")
-        .arg("15M")
+    cmd.args(crate::platform::h264_encoder_args())
         .arg("-progress")
         .arg("pipe:1")
         .arg("-nostats")
@@ -825,6 +828,7 @@ fn encode(
         return Err("Export cancelled".to_string());
     }
     if !status.success() {
+        crate::platform::trace(&format!("Export failed: ffmpeg said: {}", err_text.trim()));
         return Err(format!("ffmpeg error: {}", err_text.trim()));
     }
     let _ = tx.send(ExportEvent::Progress(1.0));

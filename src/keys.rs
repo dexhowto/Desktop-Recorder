@@ -25,6 +25,13 @@ impl ModifierKey {
 
     /// Short label for buttons and help text.
     pub fn label(self) -> &'static str {
+        // Windows keyboards name these keys differently (`Command` is the Windows key)
+        #[cfg(windows)]
+        match self {
+            ModifierKey::Command => return "Win",
+            ModifierKey::Option => return "Alt",
+            _ => {}
+        }
         match self {
             ModifierKey::Command => "⌘ Cmd",
             ModifierKey::Control => "Ctrl",
@@ -45,7 +52,8 @@ impl ModifierKey {
         }
     }
 
-    /// macOS event flag for this key (kCGEventFlagMask…).
+    /// macOS event flag for this key (kCGEventFlagMask…). On Windows the
+    /// platform layer reports keys with the same flags.
     fn flag_mask(self) -> u64 {
         match self {
             ModifierKey::Command => 0x0010_0000,
@@ -72,10 +80,21 @@ pub struct KeyBindings {
 }
 
 impl Default for KeyBindings {
+    #[cfg(target_os = "macos")]
     fn default() -> Self {
         Self {
             arrow: ModifierKey::Command,
             keep_movement: ModifierKey::Control,
+        }
+    }
+
+    /// Holding the Windows key opens the Start menu when it is released, so it
+    /// is not a default on Windows.
+    #[cfg(not(target_os = "macos"))]
+    fn default() -> Self {
+        Self {
+            arrow: ModifierKey::Control,
+            keep_movement: ModifierKey::Shift,
         }
     }
 }
