@@ -1,6 +1,6 @@
 [package]
 name = "dexhowto_recorder"
-version = "0.2.0-beta"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
