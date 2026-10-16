@@ -44,7 +44,7 @@ cat << 'EOF' > "$CONTENTS/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>__VERSION__</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
@@ -60,6 +60,9 @@ cat << 'EOF' > "$CONTENTS/Info.plist"
 </dict>
 </plist>
 EOF
+# The version shown in Finder comes from Cargo.toml
+VERSION="$(grep -m1 '^version' "$DIR/Cargo.toml" | cut -d '"' -f2)"
+sed -i '' "s/__VERSION__/$VERSION/" "$CONTENTS/Info.plist"
 
 # macOS privacy permissions (Screen Recording, Microphone) are tied to the app's
 # designated requirement. A plain ad-hoc signature uses the binary's hash, which

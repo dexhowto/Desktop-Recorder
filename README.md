@@ -73,9 +73,13 @@ If macOS reports that permission is missing even though the toggle in **System S
 │   ├── main.rs                   # App entry point and window setup
 │   ├── app.rs                    # GUI interface, widgets, and state machine
 │   ├── config.rs                 # Recording options, codecs, and defaults
-│   ├── display.rs                # ScreenCaptureKit display queries & CoreGraphics permissions
-│   ├── recorder.rs               # ScreenCaptureKit capture stream & background worker
-│   └── tray.rs                   # System tray icon, menu bar controls & countdown
+│   ├── recorder.rs               # Background recording worker (countdown, telemetry, merge)
+│   ├── telemetry.rs              # Mouse and keyboard telemetry (.mouse.jsonl)
+│   ├── tray.rs                   # System tray icon, menu bar controls & countdown
+│   └── platform/                 # Operating-system specific code, same API per system
+│       ├── mod.rs                # Paths, open/reveal files, encoder choice
+│       ├── macos/                # ScreenCaptureKit, CoreGraphics, AppKit overlay panel
+│       └── windows/              # Windows Graphics Capture, Media Foundation, WASAPI, Win32
 ├── .cargo/
 │   └── config.toml               # Swift runtime linking and macOS target flags
 ├── bundle.sh                     # Release build & ad-hoc code-signing script
@@ -91,3 +95,12 @@ To compile and package a new `.app` bundle:
 ```bash
 ./bundle.sh
 ```
+
+---
+
+## Windows (preview)
+
+The app also builds for Windows 10 2004+ / Windows 11 (phase 1: screen, microphone,
+telemetry, live overlay, editor and export; no system audio or camera yet).
+See [WINDOWS.md](WINDOWS.md) for building and what still needs testing.
+

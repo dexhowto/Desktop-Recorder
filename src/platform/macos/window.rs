@@ -5,13 +5,10 @@
 //!
 //! macOS shows a regular (Dock) app's normal window only on that app's own Spaces,
 //! never on another app's full-screen Space (Windows App, a full-screen browser…).
-//! So while the overlay is shown, its window is a non-activating panel of an
-//! accessory app (no Dock icon), which macOS does allow there. It becomes a
-//! normal window again when recording stops.
-//!
-//! The panel is made up front, not when a full-screen app is found: macOS stops
-//! drawing a window it hides behind a full-screen Space, so the app would never
-//! run again to notice the full-screen app and show itself.
+//! A non-activating panel of an accessory app (no Dock icon) may show there. macOS
+//! checks this when the Space changes: a window that only becomes a panel after
+//! the switch to a full-screen Space stays hidden there. So the overlay window is a
+//! panel of an accessory app for the whole recording, before any Space switch.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -42,7 +39,7 @@ const NONACTIVATING_PANEL: usize = 1 << 7;
 const POLICY_REGULAR: isize = 0;
 const POLICY_ACCESSORY: isize = 1;
 
-/// How often to order the overlay front (onto the current Space).
+/// How often to order the overlay front again.
 const ORDER_FRONT_INTERVAL: Duration = Duration::from_millis(500);
 
 thread_local! {
@@ -139,10 +136,10 @@ unsafe fn make_window(window: *mut AnyObject) {
     set_activation_policy(POLICY_REGULAR);
 }
 
-/// Puts the overlay above every window and on every Space, as a panel that also
-/// shows over full-screen apps. Cheap; call every frame while the overlay is
-/// shown, because egui/winit may reset the window level.
-pub fn raise_overlay_window() {
+/// Puts the overlay above every window and on every Space, as a panel of an
+/// accessory app. Cheap; call every frame while the overlay is shown, because
+/// egui/winit may reset the window level.
+pub fn raise_overlay_window(_display: (f64, f64, f64, f64)) {
     let Some(window) = main_window() else {
         return;
     };
@@ -165,6 +162,19 @@ pub fn raise_overlay_window() {
         let _: () = msg_send![window, orderFrontRegardless];
     }
 }
+
+/// On macOS the dock window itself becomes the overlay while recording.
+pub const OVERLAY_IN_DOCK: bool = true;
+
+/// Nothing to do: the dock draws its own rounded, transparent panel.
+pub fn style_dock() {}
+
+/// Not used on macOS: the overlay is drawn in the dock window (`OVERLAY_IN_DOCK`).
+pub fn show_overlay(_display: (f64, f64, f64, f64), _scene: &crate::overlay::OverlayScene) {}
+
+/// macOS leaves this app out of the recording in the capture filter instead
+/// (see `screen_capture`), so there is nothing to do here.
+pub fn set_exclude_from_capture(_exclude: bool) {}
 
 /// Makes the main window an ordinary window again (after recording).
 pub fn restore_normal_window() {

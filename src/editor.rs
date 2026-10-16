@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
@@ -18,6 +18,7 @@ use crate::ui_kit::{
 };
 use crate::arrows::{detect_arrows, Arrow, ArrowStyle};
 use crate::keys::KeyBindings;
+use crate::clicks::{clicks_in, Click, ClickKind, ClickStyle};
 use crate::export::{CursorIcon, CursorStyle, ExportEvent, ExportJob, ExportRequest};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,28 +276,6 @@ impl TelemetrySession {
             click_count: nearest.click_count,
             raw_json: nearest.raw_json.clone(),
         })
-    }
-
-    /// Check if a click event occurred recently (within `window_secs` before `t`)
-    pub fn recent_click_near(&self, t: f64, window_secs: f64) -> Option<(String, f64, f64, f64)> {
-        let t_min = t - window_secs;
-        // Search backwards from current time
-        for s in self.samples.iter().rev() {
-            if s.t < t_min {
-                break;
-            }
-            if s.t <= t {
-                let is_click = s.event == "left_click"
-                    || s.event == "right_click"
-                    || s.event == "double_click"
-                    || s.event == "middle_click";
-                if is_click {
-                    let age = t - s.t;
-                    return Some((s.event.clone(), age, s.norm_x, s.norm_y));
-                }
-            }
-        }
-        None
     }
 
     /// "Clean Move": drops plain pointer moves and keeps only the clicks (plus the
@@ -888,7 +867,7 @@ impl AsyncFrameLoader {
                     }
 
                     let t_str = format!("{:.3}", latest_time.max(0.0));
-                    let child = Command::new(&ffmpeg_bin)
+                    let child = crate::platform::command(&ffmpeg_bin)
                         .arg("-ss")
                         .arg(&t_str)
                         .arg("-i")
@@ -974,31 +953,60 @@ impl AsyncFrameLoader {
 }
 
 pub fn find_ffmpeg_bin() -> String {
+    #[cfg(target_os = "macos")]
     let candidates = [
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "ffmpeg",
+        "/opt/homebrew/bin/ffmpeg".to_string(),
+        "/usr/local/bin/ffmpeg".to_string(),
+        "ffmpeg".to_string(),
+    ];
+    // An ffmpeg.exe next to the app first, then the one on PATH, then a common install folder
+    #[cfg(windows)]
+    let candidates = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("ffmpeg.exe")))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ffmpeg.exe".to_string()),
+        "ffmpeg".to_string(),
+        r"C:\ffmpeg\bin\ffmpeg.exe".to_string(),
     ];
     for c in candidates {
-        if Command::new(c).arg("-version").output().is_ok() {
-            return c.to_string();
+        if crate::platform::command(&c).arg("-version").output().is_ok() {
+            return c;
         }
     }
     "ffmpeg".to_string()
 }
 
-pub(crate) fn probe_video_metadata(video_path: &Path) -> (f64, u32, u32, u32, bool) {
-    let ffprobe_bin = if Command::new("/opt/homebrew/bin/ffprobe")
-        .arg("-version")
-        .output()
-        .is_ok()
+/// ffprobe from the same place as ffmpeg.
+pub fn find_ffprobe_bin() -> String {
+    #[cfg(target_os = "macos")]
     {
-        "/opt/homebrew/bin/ffprobe"
-    } else {
-        "ffprobe"
-    };
+        if crate::platform::command("/opt/homebrew/bin/ffprobe")
+            .arg("-version")
+            .output()
+            .is_ok()
+        {
+            "/opt/homebrew/bin/ffprobe".to_string()
+        } else {
+            "ffprobe".to_string()
+        }
+    }
+    #[cfg(windows)]
+    {
+        let ffmpeg = PathBuf::from(find_ffmpeg_bin());
+        match ffmpeg.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            Some(dir) => dir.join("ffprobe.exe").to_string_lossy().into_owned(),
+            None => "ffprobe".to_string(),
+        }
+    }
+}
 
-    let output = Command::new(ffprobe_bin)
+pub(crate) fn probe_video_metadata(video_path: &Path) -> (f64, u32, u32, u32, bool) {
+    let ffprobe_bin = find_ffprobe_bin();
+
+    let output = crate::platform::command(ffprobe_bin)
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
@@ -1083,6 +1091,8 @@ pub struct VideoEditor {
     clean_moves_on: bool,
     /// Cursor path in the cut video, rebuilt when the cuts or Clean Move change
     cursor_track_cache: Option<(EditState, bool, TelemetrySession)>,
+    /// Clicks in `cursor_track_cache`, sorted by time
+    click_cache: Vec<Click>,
     /// Why the last "Clean Move" attempt failed, shown next to the button
     pub clean_move_message: Option<String>,
     /// What the active "Clean Move" kept and removed, shown on hover
@@ -1102,7 +1112,6 @@ pub struct VideoEditor {
 
     // Mouse overlay rendering toggles
     pub show_mouse_cursor: bool,
-    pub show_click_ripples: bool,
 
     // Frame decoder
     frame_loader: AsyncFrameLoader,
@@ -1148,6 +1157,10 @@ pub struct VideoEditor {
 
     // Cursor look, used by the preview and burned into the export
     pub cursor_style: CursorStyle,
+    /// Rings where clicks happened, in the preview and the export
+    pub click_style: ClickStyle,
+    /// The click settings of the last export started, for the app to remember
+    pub exported_click_style: Option<ClickStyle>,
 
     // Pointer arrows drawn with ⌘ while recording
     pub arrows: Vec<Arrow>,
@@ -1320,6 +1333,7 @@ impl VideoEditor {
             telemetry,
             clean_moves_on: false,
             cursor_track_cache: None,
+            click_cache: Vec::new(),
             clean_move_message: None,
             clean_move_summary: None,
             total_duration,
@@ -1333,7 +1347,6 @@ impl VideoEditor {
             last_play_instant: Instant::now(),
             skip_cut_scenes: true,
             show_mouse_cursor: true,
-            show_click_ripples: true,
             frame_loader,
             cuts: Vec::new(),
             next_cut_id: 1,
@@ -1358,6 +1371,8 @@ impl VideoEditor {
             export_job: None,
             export_dialog_open: false,
             cursor_style: CursorStyle::default(),
+            click_style: ClickStyle::default(),
+            exported_click_style: None,
             arrows,
             arrow_style: ArrowStyle::default(),
             keys: KeyBindings::default(),
@@ -1401,9 +1416,16 @@ impl VideoEditor {
                 .ok()
                 .flatten()
                 .or_else(|| self.build_cursor_track(false).ok().flatten());
+            self.click_cache = track.as_ref().map(clicks_in).unwrap_or_default();
             self.cursor_track_cache = track.map(|t| (state, self.clean_moves_on, t));
         }
         self.cursor_track_cache.as_ref().map(|(_, _, t)| t)
+    }
+
+    /// The clicks in the cut video (output time), sorted by time.
+    pub fn clicks(&mut self) -> &[Click] {
+        self.cursor_track();
+        &self.click_cache
     }
 
     /// Where recording time `t` lands in the cut video. Times inside a cut map to
@@ -1844,10 +1866,13 @@ impl VideoEditor {
             style: self.cursor_style.clone(),
             arrows: if self.arrow_style.enabled { self.kept_arrows() } else { Vec::new() },
             arrow_style: self.arrow_style.clone(),
+            clicks: if self.click_style.enabled { self.clicks().to_vec() } else { Vec::new() },
+            click_style: self.click_style.clone(),
             out_video,
             out_telemetry,
         }));
         self.export_status = Some(ExportStatus::Exporting(0.0));
+        self.exported_click_style = Some(self.click_style.clone());
     }
 
     pub fn cancel_export(&self) {
@@ -2390,17 +2415,21 @@ fn render_export_status(ui: &mut egui::Ui, editor: &mut VideoEditor) {
                             dismiss = true;
                         }
                         if button(ui, ButtonKind::Subtle, "Play", true).clicked() {
-                            let _ = Command::new("open").arg(output_video).spawn();
+                            crate::platform::open_path(output_video);
                         }
-                        if button(ui, ButtonKind::Subtle, "Show in Finder", true).clicked() {
-                            let _ = Command::new("open").arg("-R").arg(output_video).spawn();
+                        let show = format!("Show in {}", crate::platform::FILE_MANAGER);
+                        if button(ui, ButtonKind::Subtle, &show, true).clicked() {
+                            crate::platform::reveal_in_file_manager(output_video);
                         }
                         if let Some(tp) = output_telemetry {
                             if button(ui, ButtonKind::Ghost, "Telemetry", true)
-                                .on_hover_text("Reveal the re-timed .jsonl in Finder")
+                                .on_hover_text(format!(
+                                    "Reveal the re-timed .jsonl in {}",
+                                    crate::platform::FILE_MANAGER
+                                ))
                                 .clicked()
                             {
-                                let _ = Command::new("open").arg("-R").arg(tp).spawn();
+                                crate::platform::reveal_in_file_manager(tp);
                             }
                         }
                     });
@@ -2441,6 +2470,8 @@ fn render_export_dialog(ctx: &egui::Context, editor: &mut VideoEditor) {
         .to_string();
     let kept = editor.kept_duration();
     let arrow_count = editor.kept_arrows().len();
+    let click_count = editor.clicks().len();
+    let right_count = editor.clicks().iter().filter(|c| c.kind == ClickKind::Right).count();
     let (video_w, video_h) = (editor.video_width, editor.video_height);
     let mut start = false;
     let mut close = false;
@@ -2613,6 +2644,52 @@ fn render_export_dialog(ctx: &egui::Context, editor: &mut VideoEditor) {
                     });
                 }
             });
+
+            ui.add_space(16.0);
+            section_label(ui, "CLICKS");
+            card(ui, |ui| {
+                let clicks = &mut editor.click_style;
+                if click_count == 0 {
+                    ui.label(
+                        RichText::new(if has_telemetry {
+                            "No clicks inside the recorded screen in the kept parts of this recording."
+                        } else {
+                            "No mouse telemetry is attached, so no clicks can be shown."
+                        })
+                        .size(12.0)
+                        .color(theme::TEXT_DIM),
+                    );
+                    return;
+                }
+                toggle_row(
+                    ui,
+                    &format!("Show clicks ({click_count}, {right_count} right)"),
+                    "An expanding ring where each click happened. Never shown while recording.",
+                    &mut clicks.enabled,
+                );
+                ui.add_enabled_ui(clicks.enabled, |ui| {
+                    ui.add_space(8.0);
+                    for (label, rgba) in [("Left", &mut clicks.left_rgba), ("Right", &mut clicks.right_rgba)] {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [64.0, 24.0],
+                                egui::Label::new(RichText::new(label).size(12.0).color(theme::TEXT_DIM)),
+                            );
+                            for preset in CLICK_COLOR_PRESETS {
+                                if color_swatch(ui, preset, *rgba == preset).clicked() {
+                                    *rgba = preset;
+                                }
+                            }
+                        });
+                    }
+                    slider_row(ui, "Size", &mut clicks.radius, crate::clicks::RADIUS_RANGE, |v| format!("{v:.0}px"));
+                    slider_row(ui, "Duration", &mut clicks.duration_secs, crate::clicks::DURATION_RANGE, |v| {
+                        format!("{v:.2}s")
+                    });
+                    ui.add_space(8.0);
+                    click_preview(ui, clicks);
+                });
+            });
             });
 
             ui.add_space(18.0);
@@ -2661,6 +2738,59 @@ fn slider_row(
         ui.spacing_mut().slider_width = 260.0;
         ui.add(egui::Slider::new(value, range).custom_formatter(move |v, _| fmt(v)));
     });
+}
+
+/// Ring colors offered for click effects.
+pub(crate) const CLICK_COLOR_PRESETS: [[u8; 4]; 5] = [
+    [255, 196, 40, 255],
+    [88, 136, 255, 255],
+    [236, 52, 68, 255],
+    [52, 190, 120, 255],
+    [250, 250, 252, 255],
+];
+
+/// Round color button, ringed when selected.
+pub(crate) fn color_swatch(ui: &mut egui::Ui, rgba: [u8; 4], selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+    let [r, g, b, _] = rgba;
+    ui.painter().circle_filled(rect.center(), 8.0, Color32::from_rgb(r, g, b));
+    ui.painter().circle_stroke(rect.center(), 8.0, Stroke::new(1.0, theme::BORDER));
+    if selected {
+        ui.painter().circle_stroke(rect.center(), 10.0, Stroke::new(1.5, theme::TEXT));
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Loops a left, a double and a right click at their 1080p export size.
+fn click_preview(ui: &mut egui::Ui, style: &ClickStyle) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 110.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(58, 66, 84));
+    painter.rect_filled(
+        Rect::from_min_max(rect.center_top(), rect.right_bottom()),
+        egui::CornerRadius { nw: 0, ne: 8, sw: 0, se: 8 },
+        Color32::from_rgb(232, 234, 240),
+    );
+    let duration = style.duration();
+    // Each ring plays, then a short pause before it repeats
+    let period = duration + 0.6;
+    let now = ui.input(|i| i.time);
+    let max_r = style.radius_px(1080.0);
+    for (i, kind) in [ClickKind::Left, ClickKind::Double, ClickKind::Right].into_iter().enumerate() {
+        let center = Pos2::new(rect.left() + rect.width() * (0.2 + 0.3 * i as f32), rect.center().y);
+        let age = (now + i as f64 * 0.25).rem_euclid(period);
+        if age < duration {
+            draw_click_ripple(&painter, center, kind, (age / duration) as f32, max_r, style.color(kind));
+        }
+        painter.text(
+            Pos2::new(center.x, rect.bottom() - 9.0),
+            egui::Align2::CENTER_CENTER,
+            kind.label(),
+            FontId::proportional(10.5),
+            Color32::from_gray(140),
+        );
+    }
+    ui.ctx().request_repaint();
 }
 
 /// Selectable tile showing a cursor icon.
@@ -2811,17 +2941,19 @@ fn render_preview(ui: &mut egui::Ui, editor: &mut VideoEditor, height: f32) {
         video_rect.top() + (sample.norm_y as f32) * video_rect.height(),
     );
 
-    // Click Ripple Animation (if a click occurred within 350ms of current_time)
-    if editor.show_click_ripples {
-        if let Some(tel) = editor.cursor_track() {
-            if let Some((click_type, age, rx, ry)) = tel.recent_click_near(out_t, 0.35)
-            {
-                let r_center = Pos2::new(
-                    video_rect.left() + (rx as f32) * video_rect.width(),
-                    video_rect.top() + (ry as f32) * video_rect.height(),
-                );
-                draw_click_ripple(&painter, r_center, age, &click_type);
-            }
+    // Click rings, drawn like the export draws them (under the cursor)
+    if editor.click_style.enabled {
+        let style = editor.click_style.clone();
+        let duration = style.duration();
+        let max_r = style.radius_px(video_rect.height());
+        let clicks = editor.clicks();
+        for (idx, age) in crate::clicks::active_at(clicks, out_t, duration) {
+            let click = &clicks[idx];
+            let center = Pos2::new(
+                video_rect.left() + click.norm.0 as f32 * video_rect.width(),
+                video_rect.top() + click.norm.1 as f32 * video_rect.height(),
+            );
+            draw_click_ripple(&painter, center, click.kind, (age / duration) as f32, max_r, style.color(click.kind));
         }
     }
 
@@ -3246,9 +3378,9 @@ fn render_inspector(ui: &mut egui::Ui, editor: &mut VideoEditor) {
         );
         toggle_row(
             ui,
-            "Click halos",
-            "Show a ripple where clicks happened",
-            &mut editor.show_click_ripples,
+            "Click effects",
+            "Expanding rings where clicks happened, also drawn in the export",
+            &mut editor.click_style.enabled,
         );
         toggle_row(
             ui,
@@ -4042,20 +4174,41 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
         ));
     }
 
-    // Click markers from telemetry along the bottom of the clip
+    // Click markers along the bottom of the clip. A selected click can be moved
+    // in the preview or removed with Delete.
+    let click_style = editor.click_style.clone();
+    let mut hovered_click = None;
     for (idx, x) in timeline_click_dots(editor, &map) {
         if !visible(x) {
             continue;
         }
+        let Some((t, kind)) = editor
+            .telemetry
+            .as_ref()
+            .and_then(|tel| tel.samples.get(idx))
+            .and_then(|s| Some((s.t, ClickKind::from_event(&s.event)?)))
+        else {
+            continue;
+        };
         let center = Pos2::new(x, click_y);
-        let hot = hover_pos.is_some_and(|p| hit_click(p) == Some(idx));
         if editor.selected_click == Some(idx) {
-            painter.circle(center, 4.5, theme::WARN, Stroke::new(1.5, theme::SELECTED));
-        } else if hot {
-            painter.circle_filled(center, 4.0, theme::WARN);
-        } else {
-            painter.circle_filled(center, 2.5, theme::WARN.gamma_multiply(0.85));
+            painter.circle_stroke(center, 7.5, Stroke::new(1.5, theme::SELECTED));
         }
+        draw_click_marker(&painter, center, kind, &click_style);
+        if hover_pos.is_some_and(|p| hit_click(p) == Some(idx)) {
+            hovered_click = Some(Click { t: map.out_of(t), norm: (0.0, 0.0), kind });
+        }
+    }
+    if let Some(click) = hovered_click {
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            egui::Id::new("click_marker_tip"),
+            egui::PopupAnchor::Pointer,
+        )
+        .show(|ui| {
+            ui.label(format!("{} at {}", click.kind.label(), format_timecode(click.t)));
+        });
     }
 
     // ── 4. Mark In / Out selection range ─────────────────────────────────────
@@ -4303,37 +4456,59 @@ pub(crate) fn draw_arrow(painter: &egui::Painter, from: Pos2, to: Pos2, thicknes
     painter.add(egui::Shape::convex_polygon(head, fill, Stroke::NONE));
 }
 
-fn draw_click_ripple(painter: &egui::Painter, center: Pos2, age_secs: f64, click_type: &str) {
-    let progress = (age_secs / 0.35).clamp(0.0, 1.0) as f32;
-    let radius = 6.0 + (progress * 22.0);
-    let alpha = ((1.0 - progress) * 230.0) as u8;
-
-    let (ring_col, fill_col) = if click_type == "right_click" || click_type == "right_down" {
-        (
-            Color32::from_rgba_unmultiplied(40, 180, 255, alpha),
-            Color32::from_rgba_unmultiplied(20, 100, 200, alpha / 3),
-        )
-    } else {
-        (
-            Color32::from_rgba_unmultiplied(255, 200, 40, alpha),
-            Color32::from_rgba_unmultiplied(255, 160, 20, alpha / 3),
-        )
+/// One click ring, `progress` (0..1) through its animation. Uses the same
+/// geometry as the export's sprite sheet.
+fn draw_click_ripple(
+    painter: &egui::Painter,
+    center: Pos2,
+    kind: ClickKind,
+    progress: f32,
+    max_radius: f32,
+    rgba: [u8; 4],
+) {
+    let look = crate::clicks::ripple(kind, progress, max_radius);
+    let [r, g, b, a] = rgba;
+    let tint = |alpha: f32| {
+        Color32::from_rgba_unmultiplied(r, g, b, (a as f32 * alpha.clamp(0.0, 1.0)).round() as u8)
     };
-
-    painter.circle_filled(center, radius, fill_col);
-    painter.circle_stroke(
-        center,
-        radius,
-        Stroke::new(2.0 * (1.0 - progress * 0.5), ring_col),
-    );
-
-    if progress < 0.6 {
-        let dot_alpha = ((1.0 - (progress / 0.6)) * 255.0) as u8;
+    painter.circle_filled(center, look.fill_radius, tint(look.fill_alpha));
+    for ring in &look.rings {
+        painter.circle_stroke(center, ring.radius, Stroke::new(ring.width, tint(ring.alpha)));
+    }
+    if look.dot_alpha > 0.0 {
         painter.circle_filled(
             center,
-            3.0,
-            Color32::from_rgba_unmultiplied(255, 255, 255, dot_alpha),
+            look.dot_radius,
+            Color32::from_white_alpha((look.dot_alpha * 255.0).round() as u8),
         );
+    }
+}
+
+/// Timeline marker of one click: a dot for a click, two dots for a double click,
+/// a diamond for a right click and a ring for a middle click.
+fn draw_click_marker(painter: &egui::Painter, c: Pos2, kind: ClickKind, style: &ClickStyle) {
+    let [r, g, b, _] = style.color(kind);
+    let fill = Color32::from_rgb(r, g, b);
+    let edge = Stroke::new(1.0, Color32::from_black_alpha(160));
+    match kind {
+        ClickKind::Left => {
+            painter.circle(c, 3.5, fill, edge);
+        }
+        ClickKind::Double => {
+            painter.circle(c - Vec2::new(2.5, 0.0), 3.0, fill, edge);
+            painter.circle(c + Vec2::new(2.5, 0.0), 3.0, fill, edge);
+        }
+        ClickKind::Right => {
+            let d = 4.5;
+            painter.add(egui::Shape::convex_polygon(
+                vec![c - Vec2::new(0.0, d), c + Vec2::new(d, 0.0), c + Vec2::new(0.0, d), c - Vec2::new(d, 0.0)],
+                fill,
+                edge,
+            ));
+        }
+        ClickKind::Middle => {
+            painter.circle_stroke(c, 3.5, Stroke::new(2.0, fill));
+        }
     }
 }
 

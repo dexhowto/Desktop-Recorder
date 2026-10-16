@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use eframe::egui::{
@@ -84,6 +83,7 @@ pub struct DexHowToApp {
 
 impl DexHowToApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::platform::trace("Window created, setting up the app");
         // Transparent window styling for floating dock
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::TRANSPARENT;
@@ -97,7 +97,9 @@ impl DexHowToApp {
         visuals.widgets.active.bg_fill = Color32::from_rgb(60, 64, 76);
         cc.egui_ctx.set_visuals(visuals);
 
+        crate::platform::trace("Creating the tray icon");
         let tray = TrayManager::new();
+        crate::platform::trace(if tray.is_some() { "Tray icon ready" } else { "No tray icon" });
 
         let prefs = crate::prefs::Preferences::load();
 
@@ -446,7 +448,12 @@ impl DexHowToApp {
         let display = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
         self.dock_position_before_overlay = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
         self.overlay = Some(crate::overlay::LiveOverlay::new(display));
+        crate::window::set_exclude_from_capture(!self.config.record_own_windows);
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        if !crate::window::OVERLAY_IN_DOCK {
+            // Windows: the dock stays a dock; the overlay is a native window
+            return;
+        }
         ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(display.min));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(display.size()));
@@ -457,9 +464,13 @@ impl DexHowToApp {
         if self.overlay.take().is_none() {
             return;
         }
-        crate::macos_window::restore_normal_window();
-        ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(false));
+        crate::window::restore_normal_window();
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        if !crate::window::OVERLAY_IN_DOCK {
+            self.dock_position_before_overlay = None;
+            return;
+        }
+        ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(940.0, 210.0)));
         let position = self.dock_position_before_overlay.take().unwrap_or_else(|| {
             let (ox, oy, sw, sh) = crate::display::get_main_display_bounds_points();
@@ -601,7 +612,12 @@ impl eframe::App for DexHowToApp {
     /// Fully transparent window background: the dock draws its own rounded panel,
     /// and while recording the window is an invisible overlay over the screen.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        if crate::window::OVERLAY_IN_DOCK {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            // Windows: an opaque dock (the system rounds its corners)
+            theme::PANEL.to_normalized_gamma_f32()
+        }
     }
 
     /// Called continuously by eframe even when the window is minimized or hidden
@@ -624,6 +640,8 @@ impl eframe::App for DexHowToApp {
         // Enforce ideal window geometry and bottom position on startup
         if !self.did_initial_resize {
             self.did_initial_resize = true;
+            crate::platform::first_frame_drawn();
+            crate::window::style_dock();
             let (origin_x, origin_y, screen_w, screen_h) =
                 crate::display::get_main_display_bounds_points();
             let dock_w = 940.0;
@@ -648,15 +666,23 @@ impl eframe::App for DexHowToApp {
 
         // Any empty part of the dock moves the window, like a normal Mac window
         // background. Registered first, so every widget drawn later sits on top of it.
-        if self.overlay.is_some() {
+        let countdown = match self.state {
+            AppState::CountingDown(s) => Some(s),
+            _ => None,
+        };
+        let recording = matches!(self.state, AppState::Starting | AppState::Recording);
+        if self.overlay.is_some() && crate::window::OVERLAY_IN_DOCK {
             // Recording: transparent overlay with the countdown and live arrows
-            let countdown = match self.state {
-                AppState::CountingDown(s) => Some(s),
-                _ => None,
-            };
-            let recording = matches!(self.state, AppState::Starting | AppState::Recording);
             // Stay above every window (full-screen apps, remote desktops…) and on every Space
-            crate::macos_window::raise_overlay_window();
+            if let Some(overlay) = self.overlay.as_ref() {
+                let d = overlay.display;
+                crate::window::raise_overlay_window((
+                    d.min.x as f64,
+                    d.min.y as f64,
+                    d.width() as f64,
+                    d.height() as f64,
+                ));
+            }
             let style = self.prefs.arrows.clone();
             let arrow_key = self.prefs.keys.arrow;
             if let Some(overlay) = self.overlay.as_mut() {
@@ -665,6 +691,16 @@ impl eframe::App for DexHowToApp {
                     .show(ui, |ui| overlay.show(ui, countdown, recording, &style, arrow_key));
             }
         } else {
+            // Windows: the overlay is a native window next to the dock
+            if let Some(overlay) = self.overlay.as_mut() {
+                let d = overlay.display;
+                let bounds = (d.min.x as f64, d.min.y as f64, d.width() as f64, d.height() as f64);
+                crate::window::raise_overlay_window(bounds);
+                let style = &self.prefs.arrows;
+                overlay.update(d.min, recording, style, self.prefs.keys.arrow);
+                crate::window::show_overlay(bounds, &overlay.scene(countdown, recording, style));
+                ctx.request_repaint_after(Duration::from_millis(overlay.repaint_ms(countdown)));
+            }
             self.update_window_drag(&ctx);
             let background = ui.interact(
                 ui.max_rect(),
@@ -679,7 +715,7 @@ impl eframe::App for DexHowToApp {
                     egui::Frame::new()
                         .fill(theme::PANEL)
                         .stroke(Stroke::new(1.0, theme::BORDER))
-                        .corner_radius(16.0)
+                        .corner_radius(if crate::window::OVERLAY_IN_DOCK { 16.0 } else { 8.0 })
                         .inner_margin(Margin::symmetric(14, 10)),
                 )
                 .show(ui, |ui| {
@@ -750,6 +786,16 @@ impl eframe::App for DexHowToApp {
                     });
             });
 
+            // Remember the click settings of an export as the new default. Only
+            // that field is saved, so unsaved Settings edits stay unsaved.
+            if let Some(style) = editor.exported_click_style.take() {
+                if self.saved_prefs.export_clicks != style {
+                    self.prefs.export_clicks = style.clone();
+                    self.saved_prefs.export_clicks = style;
+                    self.saved_prefs.save();
+                }
+            }
+
             if close_editor {
                 self.editor = None;
             }
@@ -818,6 +864,7 @@ fn open_editor(
     let mut editor = crate::editor::VideoEditor::open(video, telemetry);
     editor.cursor_style = prefs.export_cursor.clone();
     editor.arrow_style = prefs.arrows.clone();
+    editor.click_style = prefs.export_clicks.clone();
     editor.set_key_bindings(prefs.keys.clone());
     if prefs.clean_move {
         // Recordings without telemetry have nothing to clean, so the error is ignored
@@ -890,7 +937,7 @@ fn render_dock_header(ui: &mut egui::Ui, app: &mut DexHowToApp) {
                 app.exit_app(&ctx);
             }
             if window_dot_button(ui, WindowButton::Minimize)
-                .on_hover_text("Minimize to the macOS Dock")
+                .on_hover_text(if cfg!(windows) { "Minimize to the taskbar" } else { "Minimize to the macOS Dock" })
                 .clicked()
             {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
@@ -1076,12 +1123,19 @@ fn draw_source_icon(painter: &egui::Painter, rect: Rect, source: Source, color: 
 /// One capture source: icon, name, device and an on/off switch. Clicking the tile toggles it.
 fn render_source_tile(ui: &mut egui::Ui, app: &mut DexHowToApp, source: Source, size: Vec2, is_busy: bool) {
     let (rect, tile_resp) = ui.allocate_exact_size(size, Sense::click());
-    let on = match source {
-        Source::Screen => app.screen_enabled,
-        Source::Camera => app.config.capture_camera,
-        Source::Microphone => app.config.capture_microphone,
-        Source::SystemAudio => app.config.capture_system_audio,
+    // Sources this system cannot record yet stay off and cannot be switched on
+    let supported = match source {
+        Source::Camera => crate::platform::CAMERA_SUPPORTED,
+        Source::SystemAudio => crate::platform::SYSTEM_AUDIO_SUPPORTED,
+        _ => true,
     };
+    let on = supported
+        && match source {
+            Source::Screen => app.screen_enabled,
+            Source::Camera => app.config.capture_camera,
+            Source::Microphone => app.config.capture_microphone,
+            Source::SystemAudio => app.config.capture_system_audio,
+        };
     let tint = source.tint();
     let hovered = tile_resp.hovered() && !is_busy;
 
@@ -1126,7 +1180,7 @@ fn render_source_tile(ui: &mut egui::Ui, app: &mut DexHowToApp, source: Source, 
     // Child UIs placed inside the tile (new_child does not take space in the row layout)
     let mut switch_ui = ui.new_child(egui::UiBuilder::new().max_rect(switch_rect));
     let switched = switch_ui
-        .add_enabled_ui(!is_busy, |ui| {
+        .add_enabled_ui(!is_busy && supported, |ui| {
             let mut value = on;
             settings_toggle(ui, &mut value).changed()
         })
@@ -1188,10 +1242,13 @@ fn render_source_tile(ui: &mut egui::Ui, app: &mut DexHowToApp, source: Source, 
         _ => {
             let device = match source {
                 Source::Camera => "FaceTime HD Camera",
+                Source::Microphone if cfg!(windows) => "Default microphone",
                 Source::Microphone => "Built-in microphone",
                 _ => "Mac sound output",
             };
-            let (line, color) = if on && blocked {
+            let (line, color) = if !supported {
+                ("Not on Windows yet", theme::TEXT_FAINT)
+            } else if on && blocked {
                 ("No access · click to allow", theme::WARN)
             } else if on {
                 (device, device_color)
@@ -1217,7 +1274,7 @@ fn render_source_tile(ui: &mut egui::Ui, app: &mut DexHowToApp, source: Source, 
     }
 
     // Clicking anywhere else on the tile toggles it too
-    let toggle = switched || (tile_resp.clicked() && !is_busy);
+    let toggle = supported && (switched || (tile_resp.clicked() && !is_busy));
     if toggle && !on {
         // Turning it on: ask macOS for access now, so the recording does not lack it
         if let Some(d) = av_device {
@@ -1328,17 +1385,21 @@ fn render_dock_footer(ui: &mut egui::Ui, app: &mut DexHowToApp, is_busy: bool) {
                     ));
                 }
                 if button(ui, ButtonKind::Subtle, "Play", true).clicked() {
-                    let _ = Command::new("open").arg(&path).spawn();
+                    crate::platform::open_path(&path);
                 }
-                if button(ui, ButtonKind::Ghost, "Show in Finder", true).clicked() {
-                    let _ = Command::new("open").arg("-R").arg(&path).spawn();
+                let show = format!("Show in {}", crate::platform::FILE_MANAGER);
+                if button(ui, ButtonKind::Ghost, &show, true).clicked() {
+                    crate::platform::reveal_in_file_manager(&path);
                 }
                 if let Some(camera) = app.last_camera_path.clone() {
                     if button(ui, ButtonKind::Ghost, "Camera", true)
-                        .on_hover_text("Show the camera recording in Finder")
+                        .on_hover_text(format!(
+                            "Show the camera recording in {}",
+                            crate::platform::FILE_MANAGER
+                        ))
                         .clicked()
                     {
-                        let _ = Command::new("open").arg("-R").arg(&camera).spawn();
+                        crate::platform::reveal_in_file_manager(&camera);
                     }
                 }
             } else {
@@ -1364,6 +1425,7 @@ fn render_dock_footer(ui: &mut egui::Ui, app: &mut DexHowToApp, is_busy: bool) {
             }
 
             if app.permission_denied
+                && crate::platform::HAS_PRIVACY_PERMISSIONS
                 && button(ui, ButtonKind::Tinted(theme::WARN), "Allow screen recording", true)
                     .on_hover_text("Opens System Settings › Privacy & Security › Screen Recording")
                     .clicked()
@@ -1470,16 +1532,27 @@ enum SettingsPage {
     Defaults,
     Video,
     Telemetry,
+    /// macOS only (see `SettingsPage::ALL`)
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Permissions,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 5] = [
+    #[cfg(target_os = "macos")]
+    const ALL: &[SettingsPage] = &[
         SettingsPage::Recording,
         SettingsPage::Defaults,
         SettingsPage::Video,
         SettingsPage::Telemetry,
         SettingsPage::Permissions,
+    ];
+    /// Windows has no privacy permissions to manage, so no Permissions page
+    #[cfg(not(target_os = "macos"))]
+    const ALL: &[SettingsPage] = &[
+        SettingsPage::Recording,
+        SettingsPage::Defaults,
+        SettingsPage::Video,
+        SettingsPage::Telemetry,
     ];
 
     fn title(self) -> &'static str {
@@ -1717,7 +1790,7 @@ fn render_settings_view(ui: &mut egui::Ui, app: &mut DexHowToApp) {
             });
             ui.add_space(18.0);
 
-            for page in SettingsPage::ALL {
+            for &page in SettingsPage::ALL {
                 let (row, resp) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
                 let selected = app.settings_page == page;
@@ -1807,8 +1880,9 @@ fn render_settings_view(ui: &mut egui::Ui, app: &mut DexHowToApp) {
 }
 
 fn settings_recording_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let movies = home.join("Movies");
+    let home = crate::platform::home_dir();
+    let movies = crate::platform::videos_dir();
+    let movies_label = if cfg!(windows) { "Videos" } else { "Movies" };
     let desktop = home.join("Desktop");
 
     settings_group(ui, "SAVE LOCATION", |ui| {
@@ -1828,15 +1902,15 @@ fn settings_recording_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
                 }
             }
             if button(ui, ButtonKind::Ghost, "Show", true)
-                .on_hover_text("Open the folder in Finder")
+                .on_hover_text(format!("Open the folder in {}", crate::platform::FILE_MANAGER))
                 .clicked()
             {
-                let _ = Command::new("open").arg(&app.prefs.recorder.output_dir).spawn();
+                crate::platform::open_path(&app.prefs.recorder.output_dir);
             }
         });
         row_separator(ui);
         setting_row(ui, "Quick picks", "Common places to save recordings.", 190.0, |ui| {
-            for (label, dir) in [("Desktop", &desktop), ("Movies", &movies)] {
+            for (label, dir) in [("Desktop", &desktop), (movies_label, &movies)] {
                 if !dir.exists() {
                     continue;
                 }
@@ -1900,10 +1974,11 @@ fn settings_recording_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
 fn settings_defaults_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
     settings_group(ui, "WHEN THE APP STARTS", |ui| {
         let rec = &mut app.prefs.recorder;
+        let pointer = if cfg!(windows) { "mouse" } else { "macOS" };
         setting_row(
             ui,
             "Cursor in the video",
-            "Record the macOS pointer. Turn off for a clean video: telemetry still records the mouse, and the editor can draw a cursor on export.",
+            &format!("Record the {pointer} pointer. Turn off for a clean video: telemetry still records the mouse, and the editor can draw a cursor on export."),
             60.0,
             |ui| {
                 settings_toggle(ui, &mut rec.shows_cursor);
@@ -1913,20 +1988,24 @@ fn settings_defaults_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
         setting_row(ui, "Microphone", "Record your voice.", 60.0, |ui| {
             settings_toggle(ui, &mut rec.capture_microphone);
         });
-        row_separator(ui);
-        setting_row(ui, "System audio", "Record the sound your Mac plays.", 60.0, |ui| {
-            settings_toggle(ui, &mut rec.capture_system_audio);
-        });
-        row_separator(ui);
-        setting_row(
-            ui,
-            "Camera",
-            "Save the camera as its own file next to each recording.",
-            60.0,
-            |ui| {
-                settings_toggle(ui, &mut rec.capture_camera);
-            },
-        );
+        if crate::platform::SYSTEM_AUDIO_SUPPORTED {
+            row_separator(ui);
+            setting_row(ui, "System audio", "Record the sound your Mac plays.", 60.0, |ui| {
+                settings_toggle(ui, &mut rec.capture_system_audio);
+            });
+        }
+        if crate::platform::CAMERA_SUPPORTED {
+            row_separator(ui);
+            setting_row(
+                ui,
+                "Camera",
+                "Save the camera as its own file next to each recording.",
+                60.0,
+                |ui| {
+                    settings_toggle(ui, &mut rec.capture_camera);
+                },
+            );
+        }
     });
     ui.label(
         RichText::new("Switching these in the dock changes only the current session.")
@@ -2130,6 +2209,37 @@ fn settings_defaults_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
                 settings_toggle(ui, &mut cursor.highlight);
             },
         );
+    });
+
+    settings_group(ui, "EXPORT CLICKS", |ui| {
+        let clicks = &mut app.prefs.export_clicks;
+        setting_row(
+            ui,
+            "Show clicks",
+            "Expanding rings where you clicked, in the editor and the export. Never drawn while recording.",
+            60.0,
+            |ui| {
+                settings_toggle(ui, &mut clicks.enabled);
+            },
+        );
+        for (label, rgba) in [("Left click color", &mut clicks.left_rgba), ("Right click color", &mut clicks.right_rgba)] {
+            row_separator(ui);
+            setting_row(ui, label, "", 260.0, |ui| {
+                for preset in crate::editor::CLICK_COLOR_PRESETS {
+                    if crate::editor::color_swatch(ui, preset, *rgba == preset).clicked() {
+                        *rgba = preset;
+                    }
+                }
+            });
+        }
+        row_separator(ui);
+        setting_row(ui, "Size", "", 260.0, |ui| {
+            ui.spacing_mut().slider_width = 180.0;
+            ui.add(
+                egui::Slider::new(&mut clicks.radius, crate::clicks::RADIUS_RANGE)
+                    .custom_formatter(|v, _| format!("{v:.0} px")),
+            );
+        });
     });
 
     ui.horizontal(|ui| {

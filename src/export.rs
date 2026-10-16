@@ -337,6 +337,10 @@ pub struct ExportRequest {
     /// Pointer arrows to draw (already filtered by whether arrows are enabled)
     pub arrows: Vec<crate::arrows::Arrow>,
     pub arrow_style: crate::arrows::ArrowStyle,
+    /// Clicks to show as expanding rings, in cut-video time (empty when click
+    /// effects are off)
+    pub clicks: Vec<crate::clicks::Click>,
+    pub click_style: crate::clicks::ClickStyle,
     pub out_video: PathBuf,
     pub out_telemetry: PathBuf,
 }
@@ -449,6 +453,63 @@ fn write_cursor_commands(
     w.flush().map_err(|e| format!("Failed to write cursor path: {e}"))
 }
 
+/// Writes an ffmpeg `sendcmd` script for the click rings. Every slot is a
+/// `crop@ck{n}` that picks the animation frame out of the sprite sheet and an
+/// `overlay@ck{n}` that places it. An idle slot shows the blank cell off screen.
+fn write_click_commands(
+    path: &Path,
+    req: &ExportRequest,
+    sheet: &crate::clicks::ClickSheet,
+    slots: &[Option<usize>],
+    slot_count: usize,
+    out_duration: f64,
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| format!("Failed to write click effects: {e}"))?;
+    let mut w = BufWriter::new(file);
+    let frames = (out_duration * req.fps.max(1) as f64).ceil() as u64 + 1;
+    let hidden = -100_000i64;
+    let blank = sheet.cell_xy(crate::clicks::ClickKind::Left, None);
+    let mut last: Vec<crate::clicks::SlotState> = vec![None; slot_count];
+
+    for i in 0..frames {
+        let states = crate::clicks::slot_states(
+            &req.clicks,
+            slots,
+            slot_count,
+            sheet,
+            req.click_style.duration(),
+            req.fps,
+            (req.video_width, req.video_height),
+            i,
+        );
+        let mut parts = Vec::new();
+        for (n, (state, prev)) in states.iter().zip(&last).enumerate() {
+            if i > 0 && state == prev {
+                continue;
+            }
+            let ((cx, cy), (x, y)) = state.unwrap_or((blank, (hidden, hidden)));
+            parts.push(format!(
+                "crop@ck{n} x {cx}, crop@ck{n} y {cy}, overlay@ck{n} x {x}, overlay@ck{n} y {y}"
+            ));
+        }
+        last = states;
+        if !parts.is_empty() {
+            let t = i as f64 / req.fps.max(1) as f64;
+            writeln!(w, "{t:.4} {};", parts.join(", ")).map_err(|e| format!("Failed to write click effects: {e}"))?;
+        }
+    }
+    w.flush().map_err(|e| format!("Failed to write click effects: {e}"))
+}
+
+/// Path of a temporary file as it must be written inside a filter graph: ':'
+/// separates options, so a Windows drive letter ("C:/…") must be escaped.
+fn filter_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "")
+        .replace(':', "\\:")
+}
+
 /// A rendered arrow animation and where to place it in the video.
 struct ArrowClip {
     path: PathBuf,
@@ -488,7 +549,7 @@ fn render_arrow_growth(
     let frames = (duration * ARROW_ANIM_FPS).ceil() as usize;
     let path = tmp.join(format!("arrow{index}_grow.mov"));
 
-    let mut encoder = Command::new(crate::editor::find_ffmpeg_bin())
+    let mut encoder = crate::platform::command(crate::editor::find_ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
         .args(["-s", &format!("{width}x{height}")])
@@ -616,7 +677,7 @@ fn encode(
     tmp: &Path,
     out_duration: f64,
 ) -> Result<(), String> {
-    let mut cmd = Command::new(crate::editor::find_ffmpeg_bin());
+    let mut cmd = crate::platform::command(crate::editor::find_ffmpeg_bin());
     cmd.arg("-y").arg("-i").arg(&req.video_path);
 
     // 1. Cut: trim every kept segment and join them.
@@ -672,7 +733,7 @@ fn encode(
         .collect();
 
     let mut video_out = "[vcut]".to_string();
-    if burn.is_some() || !arrows.is_empty() {
+    if burn.is_some() || !arrows.is_empty() || !req.clicks.is_empty() {
         let next_input = std::cell::Cell::new(1usize);
         let take_input = || {
             let idx = next_input.get();
@@ -743,6 +804,37 @@ fn encode(
             base = format!("[va{i}]");
         }
 
+        // Click rings, under the cursor: one sprite sheet with every animation
+        // frame, looped, and a few crop + overlay slots moved by sendcmd
+        if !req.clicks.is_empty() {
+            let sheet = crate::clicks::ClickSheet::render(&req.click_style, frame_h, fps);
+            let duration = req.click_style.duration();
+            // Leave a slot empty for two frames before reusing it, so a new ring
+            // never shows for a frame with the previous one's position
+            let gap = 2.0 / fps as f64;
+            let (slots, slot_count) =
+                crate::clicks::assign_slots(&req.clicks, duration, gap, crate::clicks::MAX_SLOTS);
+            let cmd_path = tmp.join("clicks.cmd");
+            write_click_commands(&cmd_path, req, &sheet, &slots, slot_count, out_duration)?;
+            let idx = add_sprite(&mut cmd, "clicks", &sheet.sprite, None)?;
+            let (bx, by) = sheet.cell_xy(crate::clicks::ClickKind::Left, None);
+            let outputs: String = (0..slot_count).map(|n| format!("[cks{n}]")).collect();
+            filter.push_str(&format!(
+                ";[{idx}:v]loop=loop=-1:size=1:start=0,setpts=N/({fps}*TB),\
+                 trim=duration={len:.3},format=rgba,sendcmd=f='{cmd}',split={slot_count}{outputs}",
+                len = out_duration + 1.0,
+                cmd = filter_path(&cmd_path),
+            ));
+            for n in 0..slot_count {
+                filter.push_str(&format!(
+                    ";[cks{n}]crop@ck{n}=w={cell}:h={cell}:x={bx}:y={by}[ckc{n}];\
+                     {base}[ckc{n}]overlay@ck{n}=x=-100000:y=-100000:eof_action=pass[vck{n}]",
+                    cell = sheet.cell,
+                ));
+                base = format!("[vck{n}]");
+            }
+        }
+
         if let Some(tel) = burn {
             let cursor = cursor_sprite(req.style.icon, req.style.unit_px(frame_h));
             let highlight = req.style.highlight.then(|| {
@@ -750,7 +842,7 @@ fn encode(
             });
             let cmd_path = tmp.join("cursor.cmd");
             write_cursor_commands(&cmd_path, req, tel, &cursor, highlight.as_ref(), out_duration)?;
-            let cmd_arg = cmd_path.to_string_lossy().replace('\\', "/").replace('\'', "");
+            let cmd_arg = filter_path(&cmd_path);
 
             filter.push_str(&format!(";{base}sendcmd=f='{cmd_arg}'[vcmd]"));
             base = "[vcmd]".to_string();
@@ -776,10 +868,7 @@ fn encode(
     if req.has_audio {
         cmd.arg("-map").arg("[a]").arg("-c:a").arg("aac");
     }
-    cmd.arg("-c:v")
-        .arg("h264_videotoolbox")
-        .arg("-b:v")
-        .arg("15M")
+    cmd.args(crate::platform::h264_encoder_args())
         .arg("-progress")
         .arg("pipe:1")
         .arg("-nostats")
@@ -825,6 +914,7 @@ fn encode(
         return Err("Export cancelled".to_string());
     }
     if !status.success() {
+        crate::platform::trace(&format!("Export failed: ffmpeg said: {}", err_text.trim()));
         return Err(format!("ffmpeg error: {}", err_text.trim()));
     }
     let _ = tx.send(ExportEvent::Progress(1.0));
@@ -853,5 +943,77 @@ mod tests {
         let c = sprite.hotspot.0 as usize;
         assert!(alpha(c, c) > 100);
         assert_eq!(alpha(0, 0), 0);
+    }
+
+    /// Runs a real export with ffmpeg and checks the ring is in the right frames
+    /// at the right place. Needs ffmpeg: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn test_export_burns_click_rings_into_the_video() {
+        use crate::clicks::{Click, ClickKind, ClickStyle};
+        let dir = std::env::temp_dir().join(format!("dexhowto_click_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        let ffmpeg = crate::editor::find_ffmpeg_bin();
+        let ok = crate::platform::command(&ffmpeg)
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30:d=3"])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+
+        let out = dir.join("out.mp4");
+        let style = ClickStyle::default();
+        let req = ExportRequest {
+            video_path: src,
+            // Cut out 0.5..1.0: a click recorded at 1.5 s plays at 1.0 s
+            kept_segments: vec![(0.0, 0.5), (1.0, 3.0)],
+            has_audio: false,
+            telemetry: None,
+            fps: 30,
+            video_width: 1280,
+            video_height: 720,
+            style: CursorStyle::default(),
+            arrows: Vec::new(),
+            arrow_style: crate::arrows::ArrowStyle::default(),
+            clicks: vec![
+                Click { t: 1.0, norm: (0.25, 0.5), kind: ClickKind::Left },
+                Click { t: 1.1, norm: (0.75, 0.5), kind: ClickKind::Right },
+            ],
+            click_style: style.clone(),
+            out_video: out.clone(),
+            out_telemetry: dir.join("out.mouse.jsonl"),
+        };
+        let (tx, _rx) = channel();
+        run_export(&req, &tx, &AtomicBool::new(false)).unwrap();
+
+        // Brightest pixel (RGB) of the 16 px wide strip starting at (x, y) in the
+        // frame at time t. A strip, because the thin ring is softened by encoding.
+        let brightest = |t: f64, x: u32, y: u32| -> [u8; 3] {
+            let o = crate::platform::command(&ffmpeg)
+                .args(["-loglevel", "error", "-ss", &format!("{t:.3}"), "-i"])
+                .arg(&out)
+                .args(["-frames:v", "1", "-vf", &format!("format=rgb24,crop=16:1:{x}:{y}")])
+                .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+                .output()
+                .unwrap();
+            assert_eq!(o.stdout.len(), 48, "{}", String::from_utf8_lossy(&o.stderr));
+            let px = o.stdout.chunks(3).max_by_key(|p| p.iter().map(|&c| c as u32).sum::<u32>()).unwrap();
+            [px[0], px[1], px[2]]
+        };
+        // 0.2 s after each click its ring is about this far from the click
+        let r = style.radius_px(720.0);
+        let p = 0.2 / style.duration() as f32;
+        let ring_r = r * (0.2 + 0.8 * (1.0 - (1.0 - p).powi(3)));
+        let strip_x = |cx: f32| (cx + ring_r - 8.0) as u32;
+        let left = brightest(1.2, strip_x(320.0), 360);
+        let right = brightest(1.3, strip_x(960.0), 360);
+        assert!(left[0] > 100 && left[0] > left[2] + 40, "left ring should be yellow, got {left:?}");
+        assert!(right[2] > 100 && right[2] > right[0] + 40, "right ring should be blue, got {right:?}");
+        // Nothing before the click or after the ring has faded
+        assert!(brightest(0.8, strip_x(320.0), 360).iter().all(|&c| c < 30));
+        assert!(brightest(2.2, strip_x(320.0), 360).iter().all(|&c| c < 30));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
