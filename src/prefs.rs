@@ -26,10 +26,7 @@ pub struct Preferences {
 }
 
 fn settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join("Library/Application Support/DexHowTo Recorder")
-        .join("settings.json")
+    crate::platform::app_support_dir().join("settings.json")
 }
 
 impl Preferences {

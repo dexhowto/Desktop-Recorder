@@ -170,6 +170,10 @@ pub fn raise_overlay_window(display: (f64, f64, f64, f64)) {
     }
 }
 
+/// macOS leaves this app out of the recording in the capture filter instead
+/// (see `screen_capture`), so there is nothing to do here.
+pub fn set_exclude_from_capture(_exclude: bool) {}
+
 /// Makes the main window an ordinary window again (after recording).
 pub fn restore_normal_window() {
     LAST_CHECK.set(None);

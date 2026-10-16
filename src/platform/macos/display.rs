@@ -63,6 +63,32 @@ pub fn modifier_flags() -> u64 {
     unsafe { CGEventSourceFlagsState(1) }
 }
 
+/// Cursor position in global screen points at full precision, for telemetry.
+/// (0, 0) when it cannot be read.
+pub fn telemetry_cursor_position() -> (f64, f64) {
+    unsafe {
+        let ev = CGEventCreate(std::ptr::null_mut());
+        if ev.is_null() {
+            return (0.0, 0.0);
+        }
+        let loc = CGEventGetLocation(ev);
+        CFRelease(ev);
+        (loc.x, loc.y)
+    }
+}
+
+/// Whether mouse `button` (0 left, 1 right, 2 middle) is physically held.
+pub fn mouse_button_down(button: u32) -> bool {
+    // 1 = kCGEventSourceStateHIDSystemState
+    unsafe { CGEventSourceButtonState(1, button) }
+}
+
+/// Display `id` in the space of `telemetry_cursor_position`: x, y, width, height in points.
+pub fn telemetry_display_bounds(id: u32) -> (f64, f64, f64, f64) {
+    let bounds = unsafe { CGDisplayBounds(id) };
+    (bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height)
+}
+
 /// Position and size of display `id` in global screen points (top-left origin).
 pub fn display_bounds_points(id: u32) -> (f32, f32, f32, f32) {
     let bounds = unsafe { CGDisplayBounds(id) };

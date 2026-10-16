@@ -488,7 +488,7 @@ fn render_arrow_growth(
     let frames = (duration * ARROW_ANIM_FPS).ceil() as usize;
     let path = tmp.join(format!("arrow{index}_grow.mov"));
 
-    let mut encoder = Command::new(crate::editor::find_ffmpeg_bin())
+    let mut encoder = crate::platform::command(crate::editor::find_ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
         .args(["-s", &format!("{width}x{height}")])
@@ -616,7 +616,7 @@ fn encode(
     tmp: &Path,
     out_duration: f64,
 ) -> Result<(), String> {
-    let mut cmd = Command::new(crate::editor::find_ffmpeg_bin());
+    let mut cmd = crate::platform::command(crate::editor::find_ffmpeg_bin());
     cmd.arg("-y").arg("-i").arg(&req.video_path);
 
     // 1. Cut: trim every kept segment and join them.
@@ -776,10 +776,7 @@ fn encode(
     if req.has_audio {
         cmd.arg("-map").arg("[a]").arg("-c:a").arg("aac");
     }
-    cmd.arg("-c:v")
-        .arg("h264_videotoolbox")
-        .arg("-b:v")
-        .arg("15M")
+    cmd.args(crate::platform::h264_encoder_args())
         .arg("-progress")
         .arg("pipe:1")
         .arg("-nostats")

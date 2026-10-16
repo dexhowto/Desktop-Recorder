@@ -57,8 +57,8 @@ pub struct RecorderConfig {
 
 impl Default for RecorderConfig {
     fn default() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let movies_dir = PathBuf::from(&home).join("Movies");
+        let home = crate::platform::home_dir();
+        let movies_dir = crate::platform::videos_dir();
         let output_dir = if movies_dir.exists() {
             movies_dir
         } else {

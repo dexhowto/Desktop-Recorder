@@ -1,14 +1,14 @@
+// No console window next to the app in release builds on Windows
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod arrows;
-mod av_access;
-mod camera_capture;
+mod audio_merge;
 mod config;
-mod display;
 mod editor;
-mod mic_capture;
 mod keys;
-mod macos_window;
 mod overlay;
+mod platform;
 mod prefs;
 mod export;
 mod recorder;
@@ -17,9 +17,13 @@ mod telemetry;
 mod tray;
 mod ui_kit;
 
+// The platform modules, under the same names on every system
+use platform::current::{av_access, camera_capture, display, mic_capture, screen_capture, window};
+
 use app::DexHowToApp;
 
 fn main() -> eframe::Result<()> {
+    platform::init();
     let (origin_x, origin_y, screen_w, screen_h) = crate::display::get_main_display_bounds_points();
     let dock_w = 940.0;
     let dock_h = 210.0;

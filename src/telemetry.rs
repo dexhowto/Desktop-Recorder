@@ -8,39 +8,6 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-struct CGPoint {
-    x: f64,
-    y: f64,
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-struct CGSize {
-    width: f64,
-    height: f64,
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-struct CGRect {
-    origin: CGPoint,
-    size: CGSize,
-}
-
-type CGEventRef = *mut std::ffi::c_void;
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGEventCreate(source: *mut std::ffi::c_void) -> CGEventRef;
-    fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
-    fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
-    fn CGEventSourceFlagsState(state_id: i32) -> u64;
-    fn CGDisplayBounds(display: u32) -> CGRect;
-    fn CFRelease(cf: *mut std::ffi::c_void);
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ButtonState {
     pub left: bool,
@@ -132,17 +99,18 @@ impl TelemetryHandle {
         let mut writer = BufWriter::new(file);
 
         // Query display bounds to properly offset multi-monitor coordinates
-        let bounds = unsafe { CGDisplayBounds(display_id) };
-        let point_w = if bounds.size.width > 0.0 { bounds.size.width } else { display_width as f64 };
-        let point_h = if bounds.size.height > 0.0 { bounds.size.height } else { display_height as f64 };
+        // macOS: global points; Windows: physical pixels (see `crate::display`)
+        let (origin_x, origin_y, bounds_w, bounds_h) = crate::display::telemetry_display_bounds(display_id);
+        let point_w = if bounds_w > 0.0 { bounds_w } else { display_width as f64 };
+        let point_h = if bounds_h > 0.0 { bounds_h } else { display_height as f64 };
         let scale_factor = if point_w > 0.0 { display_width as f64 / point_w } else { 1.0 };
 
         let display_info = DisplayInfo {
             id: display_id,
             width: display_width,
             height: display_height,
-            origin_x: bounds.origin.x,
-            origin_y: bounds.origin.y,
+            origin_x,
+            origin_y,
             point_width: point_w,
             point_height: point_h,
             scale_factor,
@@ -266,30 +234,18 @@ fn run_telemetry_loop(
         let time_ms = elapsed.as_millis() as u64;
         let frame = (t_secs * fps as f64).floor() as u64;
 
-        // Query macOS cursor position and system button state
-        let loc = unsafe {
-            let ev = CGEventCreate(std::ptr::null_mut());
-            if !ev.is_null() {
-                let l = CGEventGetLocation(ev);
-                CFRelease(ev);
-                l
-            } else {
-                CGPoint { x: 0.0, y: 0.0 }
-            }
-        };
-        // Modifier keys from the hardware state (1 = kCGEventSourceStateHIDSystemState).
-        // Apps that capture the keyboard (remote desktops such as Windows App) can
-        // swallow modifier events before they reach the session state.
-        let flags = unsafe { CGEventSourceFlagsState(1) };
+        // Cursor position and system button state
+        let (loc_x, loc_y) = crate::display::telemetry_cursor_position();
+        // Modifier keys from the hardware state, as macOS event flags on every system
+        let flags = crate::display::modifier_flags();
 
-        // Query hardware button states (1 = kCGEventSourceStateHIDSystemState)
-        let left_down = unsafe { CGEventSourceButtonState(1, 0) };
-        let right_down = unsafe { CGEventSourceButtonState(1, 1) };
-        let middle_down = unsafe { CGEventSourceButtonState(1, 2) };
+        let left_down = crate::display::mouse_button_down(0);
+        let right_down = crate::display::mouse_button_down(1);
+        let middle_down = crate::display::mouse_button_down(2);
 
         // Relative coordinates on the captured display
-        let rel_x = loc.x - display.origin_x;
-        let rel_y = loc.y - display.origin_y;
+        let rel_x = loc_x - display.origin_x;
+        let rel_y = loc_y - display.origin_y;
 
         let is_inside = rel_x >= 0.0 && rel_x <= display.point_width && rel_y >= 0.0 && rel_y <= display.point_height;
 
@@ -318,7 +274,8 @@ fn run_telemetry_loop(
         let mut event_type: Option<(&'static str, Option<&'static str>)> = None;
         let mut completed_click: Option<(&'static str, &'static str, u64, u32)> = None;
 
-        let is_ctrl_pressed = flags & 0x00040000 != 0;
+        // Ctrl + left click is a right click on macOS only
+        let is_ctrl_pressed = cfg!(target_os = "macos") && flags & 0x00040000 != 0;
 
         if left_changed {
             if left_down {
@@ -422,8 +379,8 @@ fn run_telemetry_loop(
                 norm_x: (norm_x * 10_000.0).round() / 10_000.0,
                 norm_y: (norm_y * 10_000.0).round() / 10_000.0,
                 is_inside,
-                global_x: (loc.x * 100.0).round() / 100.0,
-                global_y: (loc.y * 100.0).round() / 100.0,
+                global_x: (loc_x * 100.0).round() / 100.0,
+                global_y: (loc_y * 100.0).round() / 100.0,
                 event: evt_name.to_string(),
                 button: btn_name.map(|s| s.to_string()),
                 buttons: ButtonState {
@@ -453,8 +410,8 @@ fn run_telemetry_loop(
                     norm_x: (norm_x * 10_000.0).round() / 10_000.0,
                     norm_y: (norm_y * 10_000.0).round() / 10_000.0,
                     is_inside,
-                    global_x: (loc.x * 100.0).round() / 100.0,
-                    global_y: (loc.y * 100.0).round() / 100.0,
+                    global_x: (loc_x * 100.0).round() / 100.0,
+                    global_y: (loc_y * 100.0).round() / 100.0,
                     event: click_evt.to_string(),
                     button: Some(click_btn.to_string()),
                     buttons: ButtonState {

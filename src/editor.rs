@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
@@ -756,7 +756,7 @@ impl AsyncFrameLoader {
                     }
 
                     let t_str = format!("{:.3}", latest_time.max(0.0));
-                    let child = Command::new(&ffmpeg_bin)
+                    let child = crate::platform::command(&ffmpeg_bin)
                         .arg("-ss")
                         .arg(&t_str)
                         .arg("-i")
@@ -842,31 +842,60 @@ impl AsyncFrameLoader {
 }
 
 pub fn find_ffmpeg_bin() -> String {
+    #[cfg(target_os = "macos")]
     let candidates = [
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "ffmpeg",
+        "/opt/homebrew/bin/ffmpeg".to_string(),
+        "/usr/local/bin/ffmpeg".to_string(),
+        "ffmpeg".to_string(),
+    ];
+    // An ffmpeg.exe next to the app first, then the one on PATH, then a common install folder
+    #[cfg(windows)]
+    let candidates = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("ffmpeg.exe")))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ffmpeg.exe".to_string()),
+        "ffmpeg".to_string(),
+        r"C:\ffmpeg\bin\ffmpeg.exe".to_string(),
     ];
     for c in candidates {
-        if Command::new(c).arg("-version").output().is_ok() {
-            return c.to_string();
+        if crate::platform::command(&c).arg("-version").output().is_ok() {
+            return c;
         }
     }
     "ffmpeg".to_string()
 }
 
-pub(crate) fn probe_video_metadata(video_path: &Path) -> (f64, u32, u32, u32, bool) {
-    let ffprobe_bin = if Command::new("/opt/homebrew/bin/ffprobe")
-        .arg("-version")
-        .output()
-        .is_ok()
+/// ffprobe from the same place as ffmpeg.
+pub fn find_ffprobe_bin() -> String {
+    #[cfg(target_os = "macos")]
     {
-        "/opt/homebrew/bin/ffprobe"
-    } else {
-        "ffprobe"
-    };
+        if crate::platform::command("/opt/homebrew/bin/ffprobe")
+            .arg("-version")
+            .output()
+            .is_ok()
+        {
+            "/opt/homebrew/bin/ffprobe".to_string()
+        } else {
+            "ffprobe".to_string()
+        }
+    }
+    #[cfg(windows)]
+    {
+        let ffmpeg = PathBuf::from(find_ffmpeg_bin());
+        match ffmpeg.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            Some(dir) => dir.join("ffprobe.exe").to_string_lossy().into_owned(),
+            None => "ffprobe".to_string(),
+        }
+    }
+}
 
-    let output = Command::new(ffprobe_bin)
+pub(crate) fn probe_video_metadata(video_path: &Path) -> (f64, u32, u32, u32, bool) {
+    let ffprobe_bin = find_ffprobe_bin();
+
+    let output = crate::platform::command(ffprobe_bin)
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
@@ -2071,17 +2100,21 @@ fn render_export_status(ui: &mut egui::Ui, editor: &mut VideoEditor) {
                             dismiss = true;
                         }
                         if button(ui, ButtonKind::Subtle, "Play", true).clicked() {
-                            let _ = Command::new("open").arg(output_video).spawn();
+                            crate::platform::open_path(output_video);
                         }
-                        if button(ui, ButtonKind::Subtle, "Show in Finder", true).clicked() {
-                            let _ = Command::new("open").arg("-R").arg(output_video).spawn();
+                        let show = format!("Show in {}", crate::platform::FILE_MANAGER);
+                        if button(ui, ButtonKind::Subtle, &show, true).clicked() {
+                            crate::platform::reveal_in_file_manager(output_video);
                         }
                         if let Some(tp) = output_telemetry {
                             if button(ui, ButtonKind::Ghost, "Telemetry", true)
-                                .on_hover_text("Reveal the re-timed .jsonl in Finder")
+                                .on_hover_text(format!(
+                                    "Reveal the re-timed .jsonl in {}",
+                                    crate::platform::FILE_MANAGER
+                                ))
                                 .clicked()
                             {
-                                let _ = Command::new("open").arg("-R").arg(tp).spawn();
+                                crate::platform::reveal_in_file_manager(tp);
                             }
                         }
                     });
