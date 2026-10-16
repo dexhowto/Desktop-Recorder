@@ -643,15 +643,7 @@ impl eframe::App for DexHowToApp {
             };
             let recording = matches!(self.state, AppState::Starting | AppState::Recording);
             // Stay above every window (full-screen apps, remote desktops…) and on every Space
-            if let Some(overlay) = self.overlay.as_ref() {
-                let d = overlay.display;
-                crate::macos_window::raise_overlay_window((
-                    d.min.x as f64,
-                    d.min.y as f64,
-                    d.width() as f64,
-                    d.height() as f64,
-                ));
-            }
+            crate::macos_window::raise_overlay_window();
             let style = self.prefs.arrows.clone();
             let arrow_key = self.prefs.keys.arrow;
             if let Some(overlay) = self.overlay.as_mut() {
