@@ -5,6 +5,7 @@
 mod app;
 mod arrows;
 mod audio_merge;
+mod clicks;
 mod config;
 mod editor;
 mod keys;

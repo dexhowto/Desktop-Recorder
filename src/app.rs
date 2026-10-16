@@ -773,6 +773,16 @@ impl eframe::App for DexHowToApp {
                     });
             });
 
+            // Remember the click settings of an export as the new default. Only
+            // that field is saved, so unsaved Settings edits stay unsaved.
+            if let Some(style) = editor.exported_click_style.take() {
+                if self.saved_prefs.export_clicks != style {
+                    self.prefs.export_clicks = style.clone();
+                    self.saved_prefs.export_clicks = style;
+                    self.saved_prefs.save();
+                }
+            }
+
             if close_editor {
                 self.editor = None;
             }
@@ -841,6 +851,7 @@ fn open_editor(
     let mut editor = crate::editor::VideoEditor::open(video, telemetry);
     editor.cursor_style = prefs.export_cursor.clone();
     editor.arrow_style = prefs.arrows.clone();
+    editor.click_style = prefs.export_clicks.clone();
     editor.set_key_bindings(prefs.keys.clone());
     editor
 }
@@ -2118,6 +2129,37 @@ fn settings_defaults_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
                 settings_toggle(ui, &mut cursor.highlight);
             },
         );
+    });
+
+    settings_group(ui, "EXPORT CLICKS", |ui| {
+        let clicks = &mut app.prefs.export_clicks;
+        setting_row(
+            ui,
+            "Show clicks",
+            "Expanding rings where you clicked, in the editor and the export. Never drawn while recording.",
+            60.0,
+            |ui| {
+                settings_toggle(ui, &mut clicks.enabled);
+            },
+        );
+        for (label, rgba) in [("Left click color", &mut clicks.left_rgba), ("Right click color", &mut clicks.right_rgba)] {
+            row_separator(ui);
+            setting_row(ui, label, "", 260.0, |ui| {
+                for preset in crate::editor::CLICK_COLOR_PRESETS {
+                    if crate::editor::color_swatch(ui, preset, *rgba == preset).clicked() {
+                        *rgba = preset;
+                    }
+                }
+            });
+        }
+        row_separator(ui);
+        setting_row(ui, "Size", "", 260.0, |ui| {
+            ui.spacing_mut().slider_width = 180.0;
+            ui.add(
+                egui::Slider::new(&mut clicks.radius, crate::clicks::RADIUS_RANGE)
+                    .custom_formatter(|v, _| format!("{v:.0} px")),
+            );
+        });
     });
 
     ui.horizontal(|ui| {
