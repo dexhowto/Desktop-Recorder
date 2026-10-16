@@ -18,27 +18,39 @@ use std::sync::OnceLock;
 /// to the exe, or `%APPDATA%\DexHowTo Recorder\log.txt` when that folder is
 /// not writable.
 pub fn log_path() -> std::path::PathBuf {
-    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
+    log_file().0.clone()
+}
+
+/// The log, opened once per run and written in order. Appending through a new
+/// handle per line breaks on some network and VM shared folders (the writes
+/// land at a wrong offset), so the file is started fresh and kept open.
+fn log_file() -> &'static (std::path::PathBuf, std::sync::Mutex<Option<std::fs::File>>) {
+    static LOG: OnceLock<(std::path::PathBuf, std::sync::Mutex<Option<std::fs::File>>)> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let create = |path: std::path::PathBuf| std::fs::File::create(&path).ok().map(|file| (path, file));
         let beside_exe = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("log.txt")));
-        beside_exe
-            .filter(|path| std::fs::OpenOptions::new().create(true).append(true).open(path).is_ok())
-            .unwrap_or_else(|| crate::platform::app_support_dir().join("log.txt"))
+        let fallback = crate::platform::app_support_dir().join("log.txt");
+        let opened = beside_exe.and_then(create).or_else(|| {
+            let _ = std::fs::create_dir_all(crate::platform::app_support_dir());
+            create(fallback.clone())
+        });
+        match opened {
+            Some((path, file)) => (path, std::sync::Mutex::new(Some(file))),
+            None => (fallback, std::sync::Mutex::new(None)),
+        }
     })
-    .clone()
 }
 
-/// Appends a line to the log file (and to the console, when there is one).
+/// Writes a line to the log file (and to the console, when there is one).
 pub fn log_line(message: &str) {
     eprintln!("{message}");
-    let path = log_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "[{}] {message}", chrono::Local::now().to_rfc3339());
+    if let Ok(mut file) = log_file().1.lock() {
+        if let Some(file) = file.as_mut() {
+            let _ = writeln!(file, "[{}] {message}", chrono::Local::now().to_rfc3339());
+            let _ = file.flush();
+        }
     }
 }
 
