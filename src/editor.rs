@@ -1044,6 +1044,10 @@ pub struct VideoEditor {
     // selected on the timeline
     pub removed_clicks: Vec<usize>,
     pub selected_click: Option<usize>,
+    // Arrows removed in the editor (by when ⌘ was pressed, which stays the same
+    // when the arrows are found again), and the arrow selected on the timeline
+    pub removed_arrows: Vec<f64>,
+    pub selected_arrow: Option<f64>,
 
     // Interactive dragging & Mark In/Out selection
     pub active_drag: Option<DragTarget>,
@@ -1076,11 +1080,12 @@ pub struct VideoEditor {
     pub keys: KeyBindings,
 }
 
-/// One undo step: the cut list and the removed clicks.
+/// One undo step: the cut list and the removed clicks and arrows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditState {
     cuts: Vec<CutScene>,
     removed_clicks: Vec<usize>,
+    removed_arrows: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1202,6 +1207,8 @@ impl VideoEditor {
         self.telemetry = Some(session);
         self.removed_clicks.clear();
         self.selected_click = None;
+        self.removed_arrows.clear();
+        self.selected_arrow = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.clean_moves_on = false;
@@ -1253,6 +1260,8 @@ impl VideoEditor {
             selected_cut_id: None,
             removed_clicks: Vec::new(),
             selected_click: None,
+            removed_arrows: Vec::new(),
+            selected_arrow: None,
             active_drag: None,
             mark_in: None,
             mark_out: None,
@@ -1328,6 +1337,7 @@ impl VideoEditor {
             .as_ref()
             .map(|t| detect_arrows(t, aspect, self.keys.arrow))
             .unwrap_or_default();
+        self.selected_arrow = None;
         self.cursor_track_cache = None;
     }
 
@@ -1364,17 +1374,22 @@ impl VideoEditor {
 
     // ── Undo / Redo ──────────────────────────────────────────────────────────
     fn edit_state(&self) -> EditState {
-        EditState { cuts: self.cuts.clone(), removed_clicks: self.removed_clicks.clone() }
+        EditState {
+            cuts: self.cuts.clone(),
+            removed_clicks: self.removed_clicks.clone(),
+            removed_arrows: self.removed_arrows.clone(),
+        }
     }
 
     fn restore_edit_state(&mut self, state: EditState) -> EditState {
         let prev = self.edit_state();
         self.cuts = state.cuts;
         self.removed_clicks = state.removed_clicks;
+        self.removed_arrows = state.removed_arrows;
         prev
     }
 
-    /// Snapshot the cuts and removed clicks before a mutation so it can be undone.
+    /// Snapshot the cuts and removed clicks and arrows before a mutation so it can be undone.
     pub fn push_history(&mut self) {
         let state = self.edit_state();
         if self.undo_stack.last() != Some(&state) {
@@ -1423,9 +1438,33 @@ impl VideoEditor {
         }
     }
 
+    /// Removes the arrow whose ⌘ press was at `pressed_t`.
+    pub fn remove_arrow(&mut self, pressed_t: f64) {
+        if self.removed_arrows.contains(&pressed_t) {
+            return;
+        }
+        self.push_history();
+        self.removed_arrows.push(pressed_t);
+        if self.selected_arrow == Some(pressed_t) {
+            self.selected_arrow = None;
+        }
+    }
+
+    /// Arrows still in the video: not removed in the editor.
+    pub fn kept_arrows(&self) -> Vec<Arrow> {
+        self.arrows
+            .iter()
+            .filter(|a| !self.removed_arrows.contains(&a.pressed_t))
+            .cloned()
+            .collect()
+    }
+
     fn fix_selection_after_history(&mut self) {
         if self.selected_click.is_some_and(|i| self.removed_clicks.contains(&i)) {
             self.selected_click = None;
+        }
+        if self.selected_arrow.is_some_and(|t| self.removed_arrows.contains(&t)) {
+            self.selected_arrow = None;
         }
         if let Some(id) = self.selected_cut_id {
             if !self.cuts.iter().any(|c| c.id == id) {
@@ -1638,7 +1677,7 @@ impl VideoEditor {
             video_width: self.video_width,
             video_height: self.video_height,
             style: self.cursor_style.clone(),
-            arrows: if self.arrow_style.enabled { self.arrows.clone() } else { Vec::new() },
+            arrows: if self.arrow_style.enabled { self.kept_arrows() } else { Vec::new() },
             arrow_style: self.arrow_style.clone(),
             out_video,
             out_telemetry,
@@ -1941,6 +1980,8 @@ fn handle_shortcuts(ui: &mut egui::Ui, editor: &mut VideoEditor) {
         if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
             if let Some(idx) = editor.selected_click {
                 editor.remove_click(idx);
+            } else if let Some(t) = editor.selected_arrow {
+                editor.remove_arrow(t);
             } else if !editor.cut_selection() {
                 if let Some(sel_id) = editor.selected_cut_id {
                     editor.remove_cut(sel_id);
@@ -1952,6 +1993,7 @@ fn handle_shortcuts(ui: &mut egui::Ui, editor: &mut VideoEditor) {
             editor.clear_selection();
             editor.selected_cut_id = None;
             editor.selected_click = None;
+            editor.selected_arrow = None;
         }
     });
     if undo {
@@ -2233,7 +2275,7 @@ fn render_export_dialog(ctx: &egui::Context, editor: &mut VideoEditor) {
         .unwrap_or("video.mp4")
         .to_string();
     let kept = editor.kept_duration();
-    let arrow_count = editor.arrows.len();
+    let arrow_count = editor.kept_arrows().len();
     let (video_w, video_h) = (editor.video_width, editor.video_height);
     let mut start = false;
     let mut close = false;
@@ -2563,7 +2605,7 @@ fn render_preview(ui: &mut egui::Ui, editor: &mut VideoEditor, height: f32) {
         let style = &editor.arrow_style;
         let thickness = style.thickness_px(video_rect.height());
         let aspect = editor.video_width as f64 / editor.video_height.max(1) as f64;
-        for arrow in &editor.arrows {
+        for arrow in &editor.kept_arrows() {
             // Grows with the mouse while ⌘ is held, then stays and fades out
             let Some((from, tip, opacity)) = style.state_at(arrow, editor.current_time, aspect) else {
                 continue;
@@ -2942,7 +2984,7 @@ fn render_inspector(ui: &mut egui::Ui, editor: &mut VideoEditor) {
             "Jump over removed ranges while previewing",
             &mut editor.skip_cut_scenes,
         );
-        let arrow_label = format!("Arrows ({})", editor.arrows.len());
+        let arrow_label = format!("Arrows ({})", editor.kept_arrows().len());
         toggle_row(
             ui,
             &arrow_label,
@@ -2964,7 +3006,7 @@ fn render_inspector(ui: &mut egui::Ui, editor: &mut VideoEditor) {
             for (keys, what) in [
                 ("Space", "Play / pause"),
                 ("I  O", "Mark in / out"),
-                ("Del", "Cut selection, delete cut or click"),
+                ("Del", "Cut selection, delete cut, click or arrow"),
                 ("← →", "Step frame (Shift: 1 second)"),
                 ("Opt ← →", "Nudge selected cut"),
                 ("⌘Z", "Undo  (Shift ⌘Z redo)"),
@@ -3328,6 +3370,20 @@ fn timeline_click_dots(editor: &VideoEditor, map: &TimeMap) -> Vec<(usize, f32)>
         .collect()
 }
 
+/// Arrows shown on the timeline: (when ⌘ was pressed, screen x). Arrows are
+/// hidden when turned off; removed arrows and arrows inside cuts are left out.
+fn timeline_arrow_marks(editor: &VideoEditor, map: &TimeMap) -> Vec<(f64, f32)> {
+    if !editor.arrow_style.enabled {
+        return Vec::new();
+    }
+    editor
+        .kept_arrows()
+        .iter()
+        .filter(|a| map.is_kept(a.pressed_t))
+        .map(|a| (a.pressed_t, map.x(a.pressed_t)))
+        .collect()
+}
+
 fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
     const RULER_H: f32 = 24.0;
     const LANE_H: f32 = 56.0;
@@ -3396,6 +3452,21 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
             .map(|(idx, _)| idx)
     };
 
+    // Arrow markers along the top of the clip: click one to select it, Delete removes it
+    let arrow_y = strip_rect.top() + 9.5;
+    let arrow_marks = timeline_arrow_marks(editor, &map);
+    let hit_arrow = |pos: Pos2| -> Option<f64> {
+        if !strip_rect.contains(pos) || (pos.y - arrow_y).abs() > 8.0 {
+            return None;
+        }
+        arrow_marks
+            .iter()
+            .map(|&(t, x)| (t, (x - pos.x).abs()))
+            .filter(|&(_, d)| d <= 7.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(t, _)| t)
+    };
+
     let playhead_x = map.x(editor.current_time);
     // In / Out tabs on either side of the playhead head, with a gap so a click on
     // the playhead itself never hits a tab
@@ -3440,7 +3511,9 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
     if let Some(pos) = hover_pos {
         let icon = if editor.active_drag == Some(DragTarget::Pan) {
             egui::CursorIcon::Grabbing
-        } else if hit_pill(pos).is_some() || hit_marker_bar(pos).is_some() || hit_click(pos).is_some() {
+        } else if hit_pill(pos).is_some() || hit_marker_bar(pos).is_some() || hit_click(pos).is_some()
+            || hit_arrow(pos).is_some()
+        {
             egui::CursorIcon::PointingHand
         } else if on_ear_in(pos) || on_ear_out(pos) || on_selection_edge(pos).is_some() {
             egui::CursorIcon::ResizeHorizontal
@@ -3455,6 +3528,8 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
             ));
         } else if hit_click(pos).is_some() {
             track_resp.clone().on_hover_text("Click to select this click, then press Delete to remove it");
+        } else if hit_arrow(pos).is_some() {
+            track_resp.clone().on_hover_text("Click to select this arrow, then press Delete to remove it");
         }
     }
 
@@ -3568,11 +3643,18 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
             } else if let Some(id) = hit_marker_bar(pos).and_then(|m| m.ids.first().copied()) {
                 editor.selected_cut_id = Some(id);
                 editor.selected_click = None;
+                editor.selected_arrow = None;
             } else if let Some(idx) = hit_click(pos) {
                 editor.selected_click = Some(idx);
+                editor.selected_arrow = None;
+                editor.selected_cut_id = None;
+            } else if let Some(t) = hit_arrow(pos) {
+                editor.selected_arrow = Some(t);
+                editor.selected_click = None;
                 editor.selected_cut_id = None;
             } else {
                 editor.selected_click = None;
+                editor.selected_arrow = None;
                 editor.seek(map.t(pos.x));
             }
             ui.ctx().request_repaint();
@@ -3655,27 +3737,29 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
     );
 
     // Arrow markers (⌘ gestures) along the top of the clip
-    if editor.arrow_style.enabled {
-        let [r, g, b, _] = editor.arrow_style.rgba;
-        for arrow in &editor.arrows {
-            if !map.is_kept(arrow.pressed_t) {
-                continue;
-            }
-            let x = map.x(arrow.pressed_t);
-            if !visible(x) {
-                continue;
-            }
-            let top = clip_rect.top() + 2.0;
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    Pos2::new(x - 5.0, top),
-                    Pos2::new(x + 5.0, top),
-                    Pos2::new(x, top + 7.0),
-                ],
-                Color32::from_rgb(r, g, b),
-                Stroke::new(1.0, Color32::WHITE),
-            ));
+    let [r, g, b, _] = editor.arrow_style.rgba;
+    for (t, x) in arrow_marks.iter().copied() {
+        if !visible(x) {
+            continue;
         }
+        let selected = editor.selected_arrow == Some(t);
+        let hot = hover_pos.is_some_and(|p| hit_arrow(p) == Some(t));
+        let (half, height) = if selected || hot { (7.0, 10.0) } else { (5.0, 7.0) };
+        let stroke = if selected {
+            Stroke::new(1.5, theme::SELECTED)
+        } else {
+            Stroke::new(1.0, Color32::WHITE)
+        };
+        let top = arrow_y - height / 2.0 - 1.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(x - half, top),
+                Pos2::new(x + half, top),
+                Pos2::new(x, top + height),
+            ],
+            Color32::from_rgb(r, g, b),
+            stroke,
+        ));
     }
 
     // Click markers from telemetry along the bottom of the clip
@@ -4408,6 +4492,33 @@ mod tests {
         // The second click lands at its new time in the cut video (8.0 - 4.0)
         let at_click = track.sample_at(4.0).unwrap();
         assert!((at_click.x - 100.0).abs() < 0.5 && (at_click.y - 900.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_remove_arrow_hides_it_and_undo_brings_it_back() {
+        let dummy = std::env::temp_dir().join("dummy_remove_arrow.mp4");
+        let _ = File::create(&dummy);
+        let mut editor = VideoEditor::open(dummy.clone(), None);
+        let arrow = |t: f64| Arrow {
+            pressed_t: t,
+            released_t: t + 0.5,
+            from: (0.2, 0.2),
+            to: (0.6, 0.5),
+            path: Vec::new(),
+        };
+        editor.arrows = vec![arrow(1.0), arrow(3.0)];
+        editor.selected_arrow = Some(1.0);
+
+        editor.remove_arrow(1.0);
+        let kept: Vec<f64> = editor.kept_arrows().iter().map(|a| a.pressed_t).collect();
+        assert_eq!(kept, vec![3.0]);
+        assert_eq!(editor.selected_arrow, None);
+
+        editor.undo();
+        assert_eq!(editor.kept_arrows().len(), 2);
+        editor.redo();
+        assert_eq!(editor.kept_arrows().len(), 1);
+        let _ = std::fs::remove_file(dummy);
     }
 
     #[test]
