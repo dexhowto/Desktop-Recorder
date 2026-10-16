@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::arrows::ArrowStyle;
+use crate::clicks::ClickStyle;
 use crate::config::RecorderConfig;
 use crate::export::CursorStyle;
 
@@ -19,6 +20,8 @@ pub struct Preferences {
     pub recorder: RecorderConfig,
     /// Cursor look the export dialog starts with
     pub export_cursor: CursorStyle,
+    /// Click rings the editor preview and export dialog start with
+    pub export_clicks: ClickStyle,
     /// Arrows drawn with the arrow key: live while recording, in the editor, and on export
     pub arrows: ArrowStyle,
     /// Keys held while recording to draw arrows / keep exact mouse movement
@@ -63,6 +66,8 @@ mod tests {
         let mut prefs = Preferences::default();
         prefs.recorder.shows_cursor = false;
         prefs.arrows.hold_secs = 6.5;
+        prefs.export_clicks.enabled = false;
+        prefs.export_clicks.right_rgba = [1, 2, 3, 255];
         let text = serde_json::to_string(&prefs).unwrap();
         assert_eq!(serde_json::from_str::<Preferences>(&text).unwrap(), prefs);
 
@@ -71,5 +76,6 @@ mod tests {
             serde_json::from_str(r#"{"recorder": {"shows_cursor": false}}"#).unwrap();
         assert!(!partial.recorder.shows_cursor);
         assert_eq!(partial.arrows, ArrowStyle::default());
+        assert_eq!(partial.export_clicks, ClickStyle::default());
     }
 }
