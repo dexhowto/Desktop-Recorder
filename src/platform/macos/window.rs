@@ -5,12 +5,12 @@
 //!
 //! macOS shows a regular (Dock) app's normal window only on that app's own Spaces,
 //! never on another app's full-screen Space (Windows App, a full-screen browser…).
-//! So while a full-screen app covers the recorded display, the overlay window
-//! becomes a non-activating panel of an accessory app (no Dock icon), which macOS
-//! does allow there. When no app is full screen, it is a normal window again.
+//! A non-activating panel of an accessory app (no Dock icon) may show there. macOS
+//! checks this when the Space changes: a window that only becomes a panel after
+//! the switch to a full-screen Space stays hidden there. So the overlay window is a
+//! panel of an accessory app for the whole recording, before any Space switch.
 
 use std::cell::Cell;
-use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
@@ -39,13 +39,13 @@ const NONACTIVATING_PANEL: usize = 1 << 7;
 const POLICY_REGULAR: isize = 0;
 const POLICY_ACCESSORY: isize = 1;
 
-/// How often to look for a full-screen app on the recorded display.
-const FULL_SCREEN_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// How often to order the overlay front again.
+const ORDER_FRONT_INTERVAL: Duration = Duration::from_millis(500);
 
 thread_local! {
     /// winit's window class, while the window is swapped to the panel class
     static WINDOW_CLASS: Cell<Option<&'static AnyClass>> = const { Cell::new(None) };
-    static LAST_CHECK: Cell<Option<Instant>> = const { Cell::new(None) };
+    static LAST_ORDER_FRONT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 fn shared_app() -> Option<*mut AnyObject> {
@@ -136,32 +136,25 @@ unsafe fn make_window(window: *mut AnyObject) {
     set_activation_policy(POLICY_REGULAR);
 }
 
-/// Puts the overlay above every window and on every Space, and makes it a panel
-/// while a full-screen app covers `display` (global points: x, y, width, height).
-/// Cheap; call every frame while the overlay is shown, because egui/winit may
-/// reset the window level.
-pub fn raise_overlay_window(display: (f64, f64, f64, f64)) {
+/// Puts the overlay above every window and on every Space, as a panel of an
+/// accessory app. Cheap; call every frame while the overlay is shown, because
+/// egui/winit may reset the window level.
+pub fn raise_overlay_window(_display: (f64, f64, f64, f64)) {
     let Some(window) = main_window() else {
         return;
     };
     unsafe {
-        let due = LAST_CHECK.get().is_none_or(|t| t.elapsed() >= FULL_SCREEN_CHECK_INTERVAL);
+        make_panel(window);
         let level: isize = msg_send![window, level];
         let behavior: usize = msg_send![window, collectionBehavior];
         if level != OVERLAY_LEVEL || behavior != OVERLAY_BEHAVIOR {
             let _: () = msg_send![window, setLevel: OVERLAY_LEVEL];
             let _: () = msg_send![window, setCollectionBehavior: OVERLAY_BEHAVIOR];
         }
-        if !due {
+        if LAST_ORDER_FRONT.get().is_some_and(|t| t.elapsed() < ORDER_FRONT_INTERVAL) {
             return;
         }
-        LAST_CHECK.set(Some(Instant::now()));
-        let full_screen = full_screen_app_on(display);
-        if full_screen {
-            make_panel(window);
-        } else {
-            make_window(window);
-        }
+        LAST_ORDER_FRONT.set(Some(Instant::now()));
         // Bring the overlay onto the current Space (e.g. after a switch to a
         // full-screen app) without activating this app, so the other app keeps the
         // keyboard. isOnActiveSpace is always true for an all-Spaces window, so it
@@ -185,7 +178,7 @@ pub fn set_exclude_from_capture(_exclude: bool) {}
 
 /// Makes the main window an ordinary window again (after recording).
 pub fn restore_normal_window() {
-    LAST_CHECK.set(None);
+    LAST_ORDER_FRONT.set(None);
     let Some(window) = main_window() else {
         return;
     };
@@ -196,78 +189,5 @@ pub fn restore_normal_window() {
         if let Some(app) = shared_app() {
             let _: () = msg_send![app, activateIgnoringOtherApps: true];
         }
-    }
-}
-
-// --- Full-screen app detection (Core Graphics window list) ---
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct CGRect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-}
-
-const LIST_ON_SCREEN_ONLY: u32 = 1 << 0;
-const LIST_EXCLUDE_DESKTOP: u32 = 1 << 4;
-const CF_NUMBER_SINT32: isize = 3;
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> *const c_void;
-    fn CGRectMakeWithDictionaryRepresentation(dict: *const c_void, rect: *mut CGRect) -> bool;
-    static kCGWindowLayer: *const c_void;
-    static kCGWindowOwnerPID: *const c_void;
-    static kCGWindowBounds: *const c_void;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFArrayGetCount(array: *const c_void) -> isize;
-    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
-    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
-    fn CFNumberGetValue(number: *const c_void, kind: isize, value: *mut c_void) -> bool;
-    fn CFRelease(cf: *mut c_void);
-}
-
-unsafe fn dict_i32(dict: *const c_void, key: *const c_void) -> Option<i32> {
-    unsafe {
-        let number = CFDictionaryGetValue(dict, key);
-        let mut value = 0i32;
-        (!number.is_null() && CFNumberGetValue(number, CF_NUMBER_SINT32, (&raw mut value).cast()))
-            .then_some(value)
-    }
-}
-
-/// Whether another app's normal window covers all of `display`, menu bar area
-/// included: a full-screen app. A maximized window leaves the menu bar visible.
-fn full_screen_app_on(display: (f64, f64, f64, f64)) -> bool {
-    let own_pid = std::process::id() as i32;
-    let (dx, dy, dw, dh) = display;
-    unsafe {
-        let list = CGWindowListCopyWindowInfo(LIST_ON_SCREEN_ONLY | LIST_EXCLUDE_DESKTOP, 0);
-        if list.is_null() {
-            return false;
-        }
-        let mut found = false;
-        for i in 0..CFArrayGetCount(list) {
-            let info = CFArrayGetValueAtIndex(list, i);
-            if dict_i32(info, kCGWindowLayer) != Some(0) || dict_i32(info, kCGWindowOwnerPID) == Some(own_pid) {
-                continue;
-            }
-            let bounds = CFDictionaryGetValue(info, kCGWindowBounds);
-            let mut r = CGRect::default();
-            if bounds.is_null() || !CGRectMakeWithDictionaryRepresentation(bounds, &mut r) {
-                continue;
-            }
-            if r.x <= dx + 1.0 && r.y <= dy + 1.0 && r.x + r.w >= dx + dw - 1.0 && r.y + r.h >= dy + dh - 1.0 {
-                found = true;
-                break;
-            }
-        }
-        CFRelease(list.cast_mut());
-        found
     }
 }
