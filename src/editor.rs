@@ -361,6 +361,66 @@ impl TelemetrySession {
     /// Synchronizes telemetry records with kept segments (drops cuts and re-indexes continuous time)
     /// The telemetry as it plays in the cut video: records inside cut-out parts are
     /// dropped and the rest is shifted so time runs on continuously.
+    /// Copy without the click records at `removed` (indices into `samples`). The
+    /// button down/up records that made up each removed click go too, and the moves
+    /// between them become plain moves, so neither the ripple nor Clean Move sees it.
+    pub fn without_clicks(&self, removed: &[usize]) -> TelemetrySession {
+        let mut drop = vec![false; self.samples.len()];
+        let mut release: Vec<(usize, String)> = Vec::new();
+        for &idx in removed {
+            let Some(click) = self.samples.get(idx) else {
+                continue;
+            };
+            let btn = click.button.clone().unwrap_or_else(|| {
+                click.event.split('_').next().unwrap_or("left").replace("double", "left")
+            });
+            let down_evt = format!("{btn}_down");
+            let up_evt = format!("{btn}_up");
+            let down_idx = self.samples[..idx]
+                .iter()
+                .rposition(|s| s.event == down_evt)
+                .unwrap_or(idx);
+            drop[idx] = true;
+            for i in down_idx..idx {
+                let ev = &self.samples[i].event;
+                if *ev == down_evt || *ev == up_evt {
+                    drop[i] = true;
+                } else {
+                    release.push((i, btn.clone()));
+                }
+            }
+        }
+        let mut samples = self.samples.clone();
+        for (i, btn) in release {
+            let s = &mut samples[i];
+            match btn.as_str() {
+                "left" => s.left_down = false,
+                "right" => s.right_down = false,
+                _ => {}
+            }
+            if s.event == "drag" {
+                s.event = "move".to_string();
+            }
+            if let Some(obj) = s.raw_json.as_object_mut() {
+                if let Some(b) = obj.get_mut("buttons").and_then(|b| b.as_object_mut()) {
+                    b.insert(btn, Value::Bool(false));
+                }
+                obj.insert("event".into(), Value::String(s.event.clone()));
+            }
+        }
+        let samples = samples
+            .into_iter()
+            .zip(drop)
+            .filter_map(|(s, d)| (!d).then_some(s))
+            .collect();
+        TelemetrySession {
+            session_start: self.session_start.clone(),
+            samples,
+            session_end: self.session_end.clone(),
+            jsonl_path: self.jsonl_path.clone(),
+        }
+    }
+
     pub fn retimed(&self, kept_segments: &[(f64, f64)], fps: u32) -> TelemetrySession {
         let mut offsets = Vec::with_capacity(kept_segments.len());
         let mut total = 0.0;
@@ -950,7 +1010,7 @@ pub struct VideoEditor {
     /// "Clean Move" is on: the cursor glides from click to click in the cut video
     clean_moves_on: bool,
     /// Cursor path in the cut video, rebuilt when the cuts or Clean Move change
-    cursor_track_cache: Option<(Vec<CutScene>, bool, TelemetrySession)>,
+    cursor_track_cache: Option<(EditState, bool, TelemetrySession)>,
     /// Why the last "Clean Move" attempt failed, shown next to the button
     pub clean_move_message: Option<String>,
     /// What the active "Clean Move" kept and removed, shown on hover
@@ -980,6 +1040,11 @@ pub struct VideoEditor {
     next_cut_id: usize,
     pub selected_cut_id: Option<usize>,
 
+    // Clicks removed from the telemetry (indices into its samples), and the click
+    // selected on the timeline
+    pub removed_clicks: Vec<usize>,
+    pub selected_click: Option<usize>,
+
     // Interactive dragging & Mark In/Out selection
     pub active_drag: Option<DragTarget>,
     pub mark_in: Option<f64>,
@@ -992,9 +1057,9 @@ pub struct VideoEditor {
     pub snapping_enabled: bool,
     snap_guide: Option<f64>,       // time of the active snap guide (drawn while dragging)
 
-    // Undo / redo history of cut lists
-    undo_stack: Vec<Vec<CutScene>>,
-    redo_stack: Vec<Vec<CutScene>>,
+    // Undo / redo history of cuts and removed clicks
+    undo_stack: Vec<EditState>,
+    redo_stack: Vec<EditState>,
 
     // Export progress / notification
     pub export_status: Option<ExportStatus>,
@@ -1009,6 +1074,13 @@ pub struct VideoEditor {
     pub arrow_style: ArrowStyle,
     /// Keys held while recording to draw arrows / keep exact movement
     pub keys: KeyBindings,
+}
+
+/// One undo step: the cut list and the removed clicks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditState {
+    cuts: Vec<CutScene>,
+    removed_clicks: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1128,6 +1200,10 @@ impl VideoEditor {
         let aspect = self.video_width as f64 / self.video_height.max(1) as f64;
         self.arrows = detect_arrows(&session, aspect, self.keys.arrow);
         self.telemetry = Some(session);
+        self.removed_clicks.clear();
+        self.selected_click = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.clean_moves_on = false;
         self.cursor_track_cache = None;
         self.clean_move_message = None;
@@ -1175,6 +1251,8 @@ impl VideoEditor {
             cuts: Vec::new(),
             next_cut_id: 1,
             selected_cut_id: None,
+            removed_clicks: Vec::new(),
+            selected_click: None,
             active_drag: None,
             mark_in: None,
             mark_out: None,
@@ -1208,7 +1286,7 @@ impl VideoEditor {
             return Ok(None);
         };
         let kept = compute_kept_segments(&self.cuts, self.total_duration);
-        let track = tel.retimed(&kept, self.fps);
+        let track = tel.without_clicks(&self.removed_clicks).retimed(&kept, self.fps);
         if clean {
             track.clean_moves(self.fps, &self.keys).map(Some)
         } else {
@@ -1218,9 +1296,10 @@ impl VideoEditor {
 
     /// The cursor path in the cut video (output time), cleaned when Clean Move is on.
     pub fn cursor_track(&mut self) -> Option<&TelemetrySession> {
+        let state = self.edit_state();
         let fresh = matches!(
             &self.cursor_track_cache,
-            Some((cuts, clean, _)) if *cuts == self.cuts && *clean == self.clean_moves_on
+            Some((cached, clean, _)) if *cached == state && *clean == self.clean_moves_on
         );
         if !fresh {
             let track = self
@@ -1228,7 +1307,7 @@ impl VideoEditor {
                 .ok()
                 .flatten()
                 .or_else(|| self.build_cursor_track(false).ok().flatten());
-            self.cursor_track_cache = track.map(|t| (self.cuts.clone(), self.clean_moves_on, t));
+            self.cursor_track_cache = track.map(|t| (state, self.clean_moves_on, t));
         }
         self.cursor_track_cache.as_ref().map(|(_, _, t)| t)
     }
@@ -1284,10 +1363,22 @@ impl VideoEditor {
     }
 
     // ── Undo / Redo ──────────────────────────────────────────────────────────
-    /// Snapshot the current cut list before a mutation so it can be undone.
+    fn edit_state(&self) -> EditState {
+        EditState { cuts: self.cuts.clone(), removed_clicks: self.removed_clicks.clone() }
+    }
+
+    fn restore_edit_state(&mut self, state: EditState) -> EditState {
+        let prev = self.edit_state();
+        self.cuts = state.cuts;
+        self.removed_clicks = state.removed_clicks;
+        prev
+    }
+
+    /// Snapshot the cuts and removed clicks before a mutation so it can be undone.
     pub fn push_history(&mut self) {
-        if self.undo_stack.last() != Some(&self.cuts) {
-            self.undo_stack.push(self.cuts.clone());
+        let state = self.edit_state();
+        if self.undo_stack.last() != Some(&state) {
+            self.undo_stack.push(state);
             if self.undo_stack.len() > 100 {
                 self.undo_stack.remove(0);
             }
@@ -1305,19 +1396,37 @@ impl VideoEditor {
 
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
-            self.redo_stack.push(std::mem::replace(&mut self.cuts, prev));
+            let cur = self.restore_edit_state(prev);
+            self.redo_stack.push(cur);
             self.fix_selection_after_history();
         }
     }
 
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
-            self.undo_stack.push(std::mem::replace(&mut self.cuts, next));
+            let cur = self.restore_edit_state(next);
+            self.undo_stack.push(cur);
             self.fix_selection_after_history();
         }
     }
 
+    /// Removes the click record at `idx` (index into the telemetry samples).
+    pub fn remove_click(&mut self, idx: usize) {
+        if self.removed_clicks.contains(&idx) {
+            return;
+        }
+        self.push_history();
+        self.removed_clicks.push(idx);
+        self.removed_clicks.sort_unstable();
+        if self.selected_click == Some(idx) {
+            self.selected_click = None;
+        }
+    }
+
     fn fix_selection_after_history(&mut self) {
+        if self.selected_click.is_some_and(|i| self.removed_clicks.contains(&i)) {
+            self.selected_click = None;
+        }
         if let Some(id) = self.selected_cut_id {
             if !self.cuts.iter().any(|c| c.id == id) {
                 self.selected_cut_id = self.cuts.last().map(|c| c.id);
@@ -1830,7 +1939,9 @@ fn handle_shortcuts(ui: &mut egui::Ui, editor: &mut VideoEditor) {
         }
         // Delete or Backspace cuts current selection or deletes selected cut
         if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
-            if !editor.cut_selection() {
+            if let Some(idx) = editor.selected_click {
+                editor.remove_click(idx);
+            } else if !editor.cut_selection() {
                 if let Some(sel_id) = editor.selected_cut_id {
                     editor.remove_cut(sel_id);
                 }
@@ -1840,6 +1951,7 @@ fn handle_shortcuts(ui: &mut egui::Ui, editor: &mut VideoEditor) {
         if i.key_pressed(egui::Key::Escape) {
             editor.clear_selection();
             editor.selected_cut_id = None;
+            editor.selected_click = None;
         }
     });
     if undo {
@@ -2852,7 +2964,7 @@ fn render_inspector(ui: &mut egui::Ui, editor: &mut VideoEditor) {
             for (keys, what) in [
                 ("Space", "Play / pause"),
                 ("I  O", "Mark in / out"),
-                ("Del", "Cut selection or delete cut"),
+                ("Del", "Cut selection, delete cut or click"),
                 ("← →", "Step frame (Shift: 1 second)"),
                 ("Opt ← →", "Nudge selected cut"),
                 ("⌘Z", "Undo  (Shift ⌘Z redo)"),
@@ -3196,6 +3308,26 @@ fn format_ruler(t: f64, step: f64) -> String {
     }
 }
 
+/// Clicks shown on the timeline: (index into the telemetry samples, screen x).
+/// Removed clicks and clicks inside cuts are left out.
+fn timeline_click_dots(editor: &VideoEditor, map: &TimeMap) -> Vec<(usize, f32)> {
+    let Some(tel) = editor.telemetry.as_ref() else {
+        return Vec::new();
+    };
+    tel.samples
+        .iter()
+        .enumerate()
+        .filter(|(idx, s)| {
+            matches!(
+                s.event.as_str(),
+                "left_click" | "right_click" | "double_click" | "middle_click"
+            ) && map.is_kept(s.t)
+                && !editor.removed_clicks.contains(idx)
+        })
+        .map(|(idx, s)| (idx, map.x(s.t)))
+        .collect()
+}
+
 fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
     const RULER_H: f32 = 24.0;
     const LANE_H: f32 = 56.0;
@@ -3249,6 +3381,20 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
         }
         markers.iter().find(|m| (map.x_out(m.out) - pos.x).abs() <= 5.0)
     };
+    // Click dots along the bottom of the clip: click one to select it, Delete removes it
+    let click_y = strip_rect.bottom() - 13.0;
+    let click_dots = timeline_click_dots(editor, &map);
+    let hit_click = |pos: Pos2| -> Option<usize> {
+        if !strip_rect.contains(pos) || (pos.y - click_y).abs() > 8.0 {
+            return None;
+        }
+        click_dots
+            .iter()
+            .map(|&(idx, x)| (idx, (x - pos.x).abs()))
+            .filter(|&(_, d)| d <= 6.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(idx, _)| idx)
+    };
 
     let playhead_x = map.x(editor.current_time);
     // In / Out tabs on either side of the playhead head, with a gap so a click on
@@ -3294,7 +3440,7 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
     if let Some(pos) = hover_pos {
         let icon = if editor.active_drag == Some(DragTarget::Pan) {
             egui::CursorIcon::Grabbing
-        } else if hit_pill(pos).is_some() || hit_marker_bar(pos).is_some() {
+        } else if hit_pill(pos).is_some() || hit_marker_bar(pos).is_some() || hit_click(pos).is_some() {
             egui::CursorIcon::PointingHand
         } else if on_ear_in(pos) || on_ear_out(pos) || on_selection_edge(pos).is_some() {
             egui::CursorIcon::ResizeHorizontal
@@ -3307,6 +3453,8 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
                 "Undo this cut ({:.2}s): put it back and select it",
                 m.removed_secs
             ));
+        } else if hit_click(pos).is_some() {
+            track_resp.clone().on_hover_text("Click to select this click, then press Delete to remove it");
         }
     }
 
@@ -3419,7 +3567,12 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
                 editor.restore_cuts(&ids);
             } else if let Some(id) = hit_marker_bar(pos).and_then(|m| m.ids.first().copied()) {
                 editor.selected_cut_id = Some(id);
+                editor.selected_click = None;
+            } else if let Some(idx) = hit_click(pos) {
+                editor.selected_click = Some(idx);
+                editor.selected_cut_id = None;
             } else {
+                editor.selected_click = None;
                 editor.seek(map.t(pos.x));
             }
             ui.ctx().request_repaint();
@@ -3526,20 +3679,18 @@ fn render_timeline_track(ui: &mut egui::Ui, editor: &mut VideoEditor) {
     }
 
     // Click markers from telemetry along the bottom of the clip
-    if let Some(ref tel) = editor.telemetry {
-        let y = clip_rect.bottom() - 9.0;
-        for s in &tel.samples {
-            if !matches!(
-                s.event.as_str(),
-                "left_click" | "right_click" | "double_click" | "middle_click"
-            ) || !map.is_kept(s.t)
-            {
-                continue;
-            }
-            let x = map.x(s.t);
-            if visible(x) {
-                painter.circle_filled(Pos2::new(x, y), 2.5, theme::WARN.gamma_multiply(0.85));
-            }
+    for (idx, x) in timeline_click_dots(editor, &map) {
+        if !visible(x) {
+            continue;
+        }
+        let center = Pos2::new(x, click_y);
+        let hot = hover_pos.is_some_and(|p| hit_click(p) == Some(idx));
+        if editor.selected_click == Some(idx) {
+            painter.circle(center, 4.5, theme::WARN, Stroke::new(1.5, theme::SELECTED));
+        } else if hot {
+            painter.circle_filled(center, 4.0, theme::WARN);
+        } else {
+            painter.circle_filled(center, 2.5, theme::WARN.gamma_multiply(0.85));
         }
     }
 
@@ -3840,6 +3991,51 @@ fn parse_timecode(text: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_without_clicks_drops_click_and_its_buttons() {
+        let mk = |t: f64, event: &str, left: bool, button: Option<&str>| TelemetrySample {
+            t,
+            time_ms: (t * 1000.0) as u64,
+            frame: 0,
+            norm_x: 0.5,
+            norm_y: 0.5,
+            x: 0.0,
+            y: 0.0,
+            is_inside: true,
+            event: event.to_string(),
+            button: button.map(|b| b.to_string()),
+            left_down: left,
+            right_down: false,
+            click_duration_ms: None,
+            click_count: None,
+            raw_json: serde_json::json!({"event": event, "buttons": {"left": left}}),
+        };
+        let session = TelemetrySession {
+            session_start: serde_json::json!({}),
+            samples: vec![
+                mk(0.0, "move", false, None),
+                mk(1.0, "left_down", true, Some("left")),
+                mk(1.05, "drag", true, None),
+                mk(1.1, "left_up", false, Some("left")),
+                mk(1.1, "left_click", false, Some("left")),
+                mk(2.0, "move", false, None),
+                mk(3.0, "left_down", true, Some("left")),
+                mk(3.1, "left_up", false, Some("left")),
+                mk(3.1, "left_click", false, Some("left")),
+            ],
+            session_end: None,
+            jsonl_path: PathBuf::new(),
+        };
+        let out = session.without_clicks(&[4]);
+        let events: Vec<&str> = out.samples.iter().map(|s| s.event.as_str()).collect();
+        assert_eq!(
+            events,
+            ["move", "move", "move", "left_down", "left_up", "left_click"]
+        );
+        assert!(!out.samples[1].left_down);
+        assert_eq!(out.samples[1].raw_json["buttons"]["left"], serde_json::json!(false));
+    }
 
     #[test]
     fn test_compute_kept_segments() {
