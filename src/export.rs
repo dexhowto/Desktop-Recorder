@@ -750,7 +750,13 @@ fn encode(
             });
             let cmd_path = tmp.join("cursor.cmd");
             write_cursor_commands(&cmd_path, req, tel, &cursor, highlight.as_ref(), out_duration)?;
-            let cmd_arg = cmd_path.to_string_lossy().replace('\\', "/").replace('\'', "");
+            // Inside the filter, ':' separates options, so a Windows drive
+            // letter ("C:/…") must be escaped
+            let cmd_arg = cmd_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace('\'', "")
+                .replace(':', "\\:");
 
             filter.push_str(&format!(";{base}sendcmd=f='{cmd_arg}'[vcmd]"));
             base = "[vcmd]".to_string();
@@ -822,6 +828,7 @@ fn encode(
         return Err("Export cancelled".to_string());
     }
     if !status.success() {
+        crate::platform::trace(&format!("Export failed: ffmpeg said: {}", err_text.trim()));
         return Err(format!("ffmpeg error: {}", err_text.trim()));
     }
     let _ = tx.send(ExportEvent::Progress(1.0));

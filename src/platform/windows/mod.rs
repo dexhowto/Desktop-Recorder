@@ -133,16 +133,25 @@ pub fn install_panic_report() {
     }));
 }
 
-/// ffmpeg arguments for H.264 at export: the Media Foundation hardware encoder
-/// when this ffmpeg has it, otherwise libx264.
+/// ffmpeg arguments for H.264 at export: the Media Foundation encoder when it
+/// works on this PC, otherwise libx264.
 pub fn ffmpeg_h264_encoder_args() -> Vec<&'static str> {
     static HAS_MF: OnceLock<bool> = OnceLock::new();
     let has_mf = *HAS_MF.get_or_init(|| {
-        crate::platform::command(crate::editor::find_ffmpeg_bin())
-            .args(["-hide_banner", "-encoders"])
+        // An ffmpeg build can list h264_mf although Media Foundation cannot
+        // encode here (no hardware encoder, VM…), so encode one test frame
+        let works = crate::platform::command(crate::editor::find_ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error"])
+            .args(["-f", "lavfi", "-i", "color=c=black:s=320x240:r=30", "-frames:v", "5"])
+            .args(["-c:v", "h264_mf", "-b:v", "2M", "-f", "null", "-"])
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("h264_mf"))
-            .unwrap_or(false)
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        log_line(&format!(
+            "Export encoder: {}",
+            if works { "h264_mf (Media Foundation)" } else { "libx264" }
+        ));
+        works
     });
     if has_mf {
         vec!["-c:v", "h264_mf", "-b:v", "15M"]
