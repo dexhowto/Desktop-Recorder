@@ -23,6 +23,8 @@ pub struct Preferences {
     pub arrows: ArrowStyle,
     /// Keys held while recording to draw arrows / keep exact mouse movement
     pub keys: crate::keys::KeyBindings,
+    /// Turn on Clean Move when a recording opens in the editor
+    pub clean_move: bool,
 }
 
 fn settings_path() -> PathBuf {

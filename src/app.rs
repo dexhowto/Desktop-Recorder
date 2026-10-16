@@ -819,6 +819,10 @@ fn open_editor(
     editor.cursor_style = prefs.export_cursor.clone();
     editor.arrow_style = prefs.arrows.clone();
     editor.set_key_bindings(prefs.keys.clone());
+    if prefs.clean_move {
+        // Recordings without telemetry have nothing to clean, so the error is ignored
+        let _ = editor.apply_clean_moves();
+    }
     editor
 }
 
@@ -2075,6 +2079,18 @@ fn settings_defaults_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
                     .custom_formatter(|v, _| format!("{v:.0} px")),
             );
         });
+    });
+
+    settings_group(ui, "EDITOR", |ui| {
+        setting_row(
+            ui,
+            "Clean Move",
+            "Turn on Clean Move when a recording opens in the editor.",
+            60.0,
+            |ui| {
+                settings_toggle(ui, &mut app.prefs.clean_move);
+            },
+        );
     });
 
     settings_group(ui, "EXPORT CURSOR", |ui| {
