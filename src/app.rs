@@ -76,6 +76,10 @@ pub struct DexHowToApp {
     // Saved preferences (Settings window) and the copy last written to disk
     prefs: crate::prefs::Preferences,
     saved_prefs: crate::prefs::Preferences,
+    /// Do Not Disturb turned on for the recording in progress; dropping it turns it off
+    do_not_disturb: Option<crate::focus::DoNotDisturb>,
+    /// Whether the Do Not Disturb shortcuts are installed (checked when Settings shows it)
+    focus_shortcuts_installed: Option<bool>,
 }
 
 impl DexHowToApp {
@@ -128,6 +132,8 @@ impl DexHowToApp {
             overlay: None,
             dock_position_before_overlay: None,
             prefs: prefs.clone(),
+            do_not_disturb: None,
+            focus_shortcuts_installed: None,
             saved_prefs: prefs.clone(),
         };
 
@@ -195,6 +201,7 @@ impl DexHowToApp {
                 }
                 RecorderEvent::CountdownCancelled => {
                     self.state = AppState::Idle;
+                    self.do_not_disturb = None;
                     if let Some(ref tray) = self.tray {
                         tray.set_idle();
                     }
@@ -236,6 +243,7 @@ impl DexHowToApp {
                     file_size_bytes,
                 } => {
                     self.state = AppState::Finished;
+                    self.do_not_disturb = None;
                     self.last_saved_duration = duration_secs;
                     self.last_saved_size = file_size_bytes;
 
@@ -289,6 +297,7 @@ impl DexHowToApp {
                 }
                 RecorderEvent::Error(err) => {
                     self.state = AppState::Error(err);
+                    self.do_not_disturb = None;
                     if let Some(ref tray) = self.tray {
                         tray.set_idle();
                     }
@@ -406,6 +415,9 @@ impl DexHowToApp {
         let target_path = self.config.temporary_recording_path();
         self.pending_recording_base = Some(RecorderConfig::recording_base_name());
         self.state = AppState::CountingDown(5);
+        if self.config.do_not_disturb {
+            self.do_not_disturb = Some(crate::focus::DoNotDisturb::begin());
+        }
 
         if let Some(ref tray) = self.tray {
             tray.set_countdown(5);
@@ -562,6 +574,7 @@ impl DexHowToApp {
             auto_open_editor,
             ask_save_location,
             record_own_windows,
+            do_not_disturb,
             fps,
             codec,
             format,
@@ -1913,6 +1926,57 @@ fn settings_defaults_page(ui: &mut egui::Ui, app: &mut DexHowToApp) {
     });
     ui.label(
         RichText::new("Switching these in the dock changes only the current session.")
+            .size(11.5)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.add_space(16.0);
+
+    let installed = *app
+        .focus_shortcuts_installed
+        .get_or_insert_with(crate::focus::shortcuts_installed);
+    settings_group(ui, "WHILE RECORDING", |ui| {
+        setting_row(
+            ui,
+            "Do Not Disturb",
+            "Turn on Do Not Disturb when a recording starts, so notifications stay out of the video, and turn it off when it stops.",
+            60.0,
+            |ui| {
+                settings_toggle(ui, &mut app.prefs.recorder.do_not_disturb);
+            },
+        );
+        row_separator(ui);
+        let status = if installed {
+            "Installed. Do Not Disturb is set with two shortcuts in the Shortcuts app."
+        } else {
+            "Needed for Do Not Disturb. Add both shortcuts when the Shortcuts app asks, then press Check."
+        };
+        setting_row(ui, "Focus shortcuts", status, 200.0, |ui| {
+            if button(ui, ButtonKind::Ghost, "Check", true)
+                .on_hover_text("Look again for the shortcuts")
+                .clicked()
+            {
+                app.focus_shortcuts_installed = None;
+            }
+            let label = if installed { "Reinstall" } else { "Install" };
+            let kind = if installed {
+                ButtonKind::Subtle
+            } else {
+                ButtonKind::Tinted(theme::ACCENT)
+            };
+            if button(ui, kind, label, true)
+                .on_hover_text(format!(
+                    "Add \"{}\" and \"{}\" to Shortcuts",
+                    crate::focus::SHORTCUT_ON,
+                    crate::focus::SHORTCUT_OFF
+                ))
+                .clicked()
+            {
+                crate::focus::install_shortcuts();
+            }
+        });
+    });
+    ui.label(
+        RichText::new("If Do Not Disturb was already on before recording, it is off afterwards.")
             .size(11.5)
             .color(theme::TEXT_FAINT),
     );

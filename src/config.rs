@@ -49,6 +49,8 @@ pub struct RecorderConfig {
     /// Record this app's own windows too (full screen). Off: the dock, editor,
     /// countdown and live ⌘ arrows are left out of the video.
     pub record_own_windows: bool,
+    /// Turn on Do Not Disturb while recording, and off again when it stops
+    pub do_not_disturb: bool,
     pub fps: u32,
     pub codec: VideoCodec,
     pub format: OutputFormat,
@@ -81,6 +83,7 @@ impl Default for RecorderConfig {
             auto_open_editor: true,
             ask_save_location: true,
             record_own_windows: false,
+            do_not_disturb: true,
             fps: 60,
             codec: VideoCodec::H264,
             format: OutputFormat::MP4,

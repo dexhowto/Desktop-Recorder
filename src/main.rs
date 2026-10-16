@@ -5,6 +5,7 @@ mod camera_capture;
 mod config;
 mod display;
 mod editor;
+mod focus;
 mod mic_capture;
 mod keys;
 mod macos_window;
