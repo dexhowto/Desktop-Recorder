@@ -1,0 +1,9 @@
+[env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-L", "/Library/Developer/CommandLineTools/usr/lib/swift/macosx",
+    "-C", "link-arg=-Wl,-rpath,/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx",
+    "-C", "link-arg=-Wl,-rpath,/usr/lib/swift",
+]
