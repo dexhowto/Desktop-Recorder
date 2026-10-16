@@ -4,9 +4,9 @@ Run "DexHowTo Recorder.exe". It needs Windows 10 2004 or later, or Windows 11.
 On Windows 11 for ARM (for example in UTM on a Mac) it runs through x64 emulation.
 The exe is not signed, so SmartScreen may warn: click "More info", then "Run anyway".
 
-ffmpeg: recording the screen works without it, but the microphone, the editor
-and export need ffmpeg.exe and ffprobe.exe. Put both next to the .exe or on PATH
-(for example the "essentials" build from https://www.gyan.dev/ffmpeg/builds/).
+ffmpeg.exe and ffprobe.exe are included (used for the microphone, the editor
+and export). Keep them in this folder next to the app. FFmpeg is GPL-3.0; see
+the ffmpeg-license folder for its license and source.
 
 Not available yet on Windows: system audio, camera.
 Default keys: hold Ctrl while moving the mouse to draw an arrow,

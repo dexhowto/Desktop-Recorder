@@ -29,8 +29,8 @@ Default keys on Windows: Ctrl draws arrows, Shift keeps a movement in Clean Move
 
 - System audio (TODO: WASAPI loopback).
 - Camera (TODO: ffmpeg `-f dshow`).
-- Installer. For now copy `dexhowto_recorder.exe` and put `ffmpeg.exe` and
-  `ffprobe.exe` next to it or on PATH.
+- Installer. For now unzip the release; it includes `ffmpeg.exe` and `ffprobe.exe`
+  (FFmpeg 9.0.2, Gyan's GPL "essentials" build), which the app finds next to its exe.
 
 ## Build
 
@@ -41,8 +41,9 @@ cargo build --release
 ```
 
 From a Mac, `./make_windows_zip.sh` builds the release zip
-(`dist/DexHowTo-Recorder-<version>-Windows-x64.zip`: the app, a console build and a
-README). By hand, build a Windows x64 .exe with mingw-w64 (it also runs on Windows 11
+(`dist/DexHowTo-Recorder-<version>-Windows-x64.zip`: the app, a console build,
+ffmpeg/ffprobe with their GPL license and source links, and a README). The ffmpeg
+download is pinned by version and SHA-256 and cached in `target/ffmpeg-windows`. By hand, build a Windows x64 .exe with mingw-w64 (it also runs on Windows 11
 for ARM, for example in UTM, through x64 emulation):
 
 ```bash
