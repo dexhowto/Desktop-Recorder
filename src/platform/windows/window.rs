@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowTextW, GetWindowThreadProcessId, SetWindowDisplayAffinity, SetWindowPos,
     HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
@@ -33,6 +34,8 @@ thread_local! {
     static EXCLUDE: Cell<bool> = const { Cell::new(false) };
     static LAST_REFRESH: Cell<Option<Instant>> = const { Cell::new(None) };
     static OVERLAY: RefCell<Option<OverlayWindow>> = const { RefCell::new(None) };
+    /// A failed exclusion is logged once, not every refresh
+    static REPORTED_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Top-level windows of this process.
@@ -102,13 +105,27 @@ pub fn set_exclude_from_capture(exclude: bool) {
     LAST_REFRESH.set(None);
 }
 
+/// The app's windows on this (the UI) thread. Other threads own only hidden
+/// helper windows (input method, tray icon…), which SetWindowDisplayAffinity
+/// refuses with "Access is denied".
+fn ui_thread_windows() -> Vec<HWND> {
+    let thread = unsafe { GetCurrentThreadId() };
+    own_windows()
+        .into_iter()
+        .filter(|h| unsafe { GetWindowThreadProcessId(*h, None) } == thread)
+        .collect()
+}
+
 fn apply_capture_affinity(exclude: bool) {
     let affinity = if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
-    for hwnd in own_windows() {
+    for hwnd in ui_thread_windows() {
         // Fails before Windows 10 2004; the windows are then recorded too
         if let Err(e) = unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
-            if exclude {
-                super::log_line(&format!("Could not leave a window out of the recording: {e}"));
+            if exclude && !REPORTED_FAILURE.replace(true) {
+                super::log_line(&format!(
+                    "Could not leave the window \"{}\" out of the recording: {e}",
+                    title(hwnd)
+                ));
             }
         }
     }
