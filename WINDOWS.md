@@ -33,7 +33,20 @@ On Windows (MSVC toolchain):
 cargo build --release
 ```
 
-From a Mac, type-check only:
+From a Mac, build a Windows x64 .exe with mingw-w64 (it also runs on Windows 11
+for ARM, for example in UTM, through x64 emulation):
+
+```bash
+brew install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+  cargo build --release --target x86_64-pc-windows-gnu
+```
+
+The .exe is `target/x86_64-pc-windows-gnu/release/dexhowto_recorder.exe` and only
+needs system DLLs.
+
+From a Mac, type-check the MSVC target only:
 
 ```bash
 rustup target add x86_64-pc-windows-msvc
