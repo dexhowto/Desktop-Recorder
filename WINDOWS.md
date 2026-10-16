@@ -40,7 +40,9 @@ On Windows (MSVC toolchain):
 cargo build --release
 ```
 
-From a Mac, build a Windows x64 .exe with mingw-w64 (it also runs on Windows 11
+From a Mac, `./make_windows_zip.sh` builds the release zip
+(`dist/DexHowTo-Recorder-<version>-Windows-x64.zip`: the app, a console build and a
+README). By hand, build a Windows x64 .exe with mingw-w64 (it also runs on Windows 11
 for ARM, for example in UTM, through x64 emulation):
 
 ```bash
